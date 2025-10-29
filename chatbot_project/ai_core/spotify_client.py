@@ -1,28 +1,39 @@
-"""Spotify Web API를 얇게 감싸서 인증과 추천 호출을 처리하면 됨."""
 
+# ai_core/spotify_client.py
 from __future__ import annotations
 
-import base64
+import os
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple, Set, Any
 
 import requests
 
-from .config import Settings
 
-
-class SpotifyAuthError(RuntimeError):
-    """Spotify 인증에 실패하면 이 예외를 던지면 됨."""
+class SpotifyAuthError(Exception):
+    pass
 
 
 class SpotifyClient:
-    """토큰 관리까지 포함한 Spotify Web API 클라이언트를 제공하면 됨."""
+    """
+    Safe Spotify client with:
+    - Robust Settings/env loading (accepts a Settings object or explicit args)
+    - Client Credentials token management
+    - Avoids deprecated endpoints when blocked for new apps
+    - Fallback: Search + Artist Top Tracks instead of /recommendations
+    """
 
-    TOKEN_URL = "https://accounts.spotify.com/api/token"
     API_BASE_URL = "https://api.spotify.com/v1"
+    TOKEN_URL = "https://accounts.spotify.com/api/token"
 
-    # Spotify 문서에 명시된 오디오 피처 값 범위를 정리해두면 됨.
-    FEATURE_RANGES: Dict[str, Tuple[float, float]] = {
+    # Conservative default seeds for dance/house use-cases
+    DEFAULT_SEED_GENRES: Set[str] = {
+        "house", "deep-house", "dance", "edm", "electro", "disco", "club",
+        "progressive-house", "techno", "trance",
+        "pop", "k-pop", "hip-hop", "r-n-b", "funk", "latin"
+    }
+
+    # Allowed ranges for some target_* features to avoid 400s
+    _FEATURE_LIMITS = {
         "acousticness": (0.0, 1.0),
         "danceability": (0.0, 1.0),
         "energy": (0.0, 1.0),
@@ -30,232 +41,347 @@ class SpotifyClient:
         "liveness": (0.0, 1.0),
         "speechiness": (0.0, 1.0),
         "valence": (0.0, 1.0),
-        "tempo": (0.0, 250.0),
+        "popularity": (0, 100),
+        "tempo": (30.0, 250.0),
         "loudness": (-60.0, 0.0),
+        "key": (0, 11),
+        "mode": (0, 1),
+        "time_signature": (3, 7),
     }
 
-    def __init__(self, settings: Settings):
-        self._client_id = settings.spotify_client_id
-        self._client_secret = settings.spotify_client_secret
-        self._refresh_token = settings.spotify_refresh_token
-        self._redirect_uri = settings.spotify_redirect_uri
-        self._default_seed_genres = settings.spotify_default_seed_genres
+    def __init__(
+        self,
+        settings: Optional[Any] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+        market: Optional[str] = None,
+        session: Optional[requests.Session] = None,
+    ) -> None:
+        """
+        Initialize with Settings object, explicit args, or environment variables.
+        Recognized Settings names: spotify_client_id/secret/market (case-insensitive variants also work).
+        """
+        def _pull(obj: Any, *names: str) -> Optional[str]:
+            for name in names:
+                if hasattr(obj, name):
+                    v = getattr(obj, name)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+                if isinstance(obj, dict) and name in obj:
+                    v = obj.get(name)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+            return None
+
+        # explicit
+        cid = client_id.strip() if isinstance(client_id, str) and client_id.strip() else None
+        csec = client_secret.strip() if isinstance(client_secret, str) and client_secret.strip() else None
+        mkt = market.strip() if isinstance(market, str) and market.strip() else None
+
+        # settings
+        if settings is not None:
+            cid = cid or _pull(settings, "spotify_client_id", "SPOTIFY_CLIENT_ID", "client_id")
+            csec = csec or _pull(settings, "spotify_client_secret", "SPOTIFY_CLIENT_SECRET", "client_secret")
+            mkt = mkt or _pull(settings, "spotify_market", "SPOTIFY_MARKET", "market")
+
+        # env
+        cid = cid or os.getenv("SPOTIFY_CLIENT_ID")
+        csec = csec or os.getenv("SPOTIFY_CLIENT_SECRET")
+        mkt = mkt or os.getenv("SPOTIFY_MARKET") or "KR"
+
+        if not cid or not csec:
+            raise SpotifyAuthError("SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET 누락")
+
+        self.client_id: str = cid
+        self.client_secret: str = csec
+        self.market: str = mkt
+        self._session = session or requests.Session()
 
         self._access_token: Optional[str] = None
         self._token_expiry: float = 0.0
-        self._cached_genre_seeds: Optional[Set[str]] = None
 
-    # ------------------------------------------------------------------
-    # 인증 보조 함수는 이렇게 묶으면 됨
-    # ------------------------------------------------------------------
-    def _authorisation_header(self) -> Dict[str, str]:
-        if not self._access_token or time.time() >= self._token_expiry - 30:
-            self._refresh_access_token()
+        self._cached_genre_seeds: Set[str] = set()
+        self._default_seed_genres: Set[str] = set(self.DEFAULT_SEED_GENRES)
 
-        return {"Authorization": f"Bearer {self._access_token}"}
+        self._obtain_access_token()
 
-    def _refresh_access_token(self) -> None:
-        """설정된 전략에 맞게 새 액세스 토큰을 받아오면 됨."""
+    # ---------- Auth ----------
 
-        payload = {"grant_type": "client_credentials"}
-
-        if self._refresh_token:
-            payload = {
-                "grant_type": "refresh_token",
-                "refresh_token": self._refresh_token,
-            }
-
-            if self._redirect_uri:
-                payload["redirect_uri"] = self._redirect_uri
-
-        auth_header = base64.b64encode(
-            f"{self._client_id}:{self._client_secret}".encode("utf-8")
-        ).decode("utf-8")
-
-        response = requests.post(
+    def _obtain_access_token(self) -> None:
+        data = {"grant_type": "client_credentials"}
+        resp = self._session.post(
             self.TOKEN_URL,
-            data=payload,
-            headers={"Authorization": f"Basic {auth_header}"},
+            data=data,
+            auth=(self.client_id, self.client_secret),
             timeout=15,
         )
-
-        if response.status_code != 200:
-            raise SpotifyAuthError(
-                "Failed to refresh Spotify token: "
-                f"{response.status_code} {response.text}"
-            )
-
-        payload = response.json()
+        if not resp.ok:
+            hint = ""
+            try:
+                j = resp.json()
+                if j.get("error") == "invalid_client":
+                    hint = " (invalid_client: Client ID/Secret 재확인/재발급 필요)"
+            except Exception:
+                pass
+            raise SpotifyAuthError(f"토큰 발급 실패: {resp.status_code} {resp.text}{hint}")
+        payload = resp.json()
         self._access_token = payload["access_token"]
-        expires_in = payload.get("expires_in", 3600)
-        self._token_expiry = time.time() + expires_in
+        self._token_expiry = time.time() + int(payload.get("expires_in", 3600)) - 60
 
-    # ------------------------------------------------------------------
-    # 외부에서 사용하는 공개 API는 이렇게 두면 됨
-    # ------------------------------------------------------------------
+    def _refresh_access_token(self) -> None:
+        if self._access_token is None or time.time() >= self._token_expiry:
+            self._obtain_access_token()
+
+    def _auth_header(self) -> Dict[str, str]:
+        self._refresh_access_token()
+        return {"Authorization": f"Bearer {self._access_token}"}
+
+    # ---------- Genres ----------
+
+    def _get_available_genre_seeds(self) -> Set[str]:
+        """
+        Try deprecated endpoint; if blocked/404/403, fall back to default list.
+        """
+        if self._cached_genre_seeds:
+            return self._cached_genre_seeds
+
+        url = f"{self.API_BASE_URL}/recommendations/available-genre-seeds"
+        try:
+            r = self._session.get(url, headers=self._auth_header(), timeout=15)
+            if r.status_code == 401:
+                self._refresh_access_token()
+                r = self._session.get(url, headers=self._auth_header(), timeout=15)
+
+            if r.status_code in (403, 404):
+                genres = set(self._default_seed_genres)
+            else:
+                r.raise_for_status()
+                genres = set((r.json() or {}).get("genres") or []) or set(self._default_seed_genres)
+        except requests.RequestException:
+            genres = set(self._default_seed_genres)
+
+        self._cached_genre_seeds = genres
+        return genres
+
+    def _select_seed_genres(self, seed_genres: Optional[List[str]]) -> List[str]:
+        if not seed_genres:
+            return []
+        avail = self._get_available_genre_seeds()
+        filtered = [g for g in seed_genres if isinstance(g, str) and g.lower() in avail]
+        return filtered[:5]
+
+    # ---------- Fallback helpers ----------
+
+    def _seed_artists_from_genres(
+        self,
+        genres: Optional[List[str]],
+        *,
+        limit: int = 5,
+        market: Optional[str] = None,
+    ) -> List[str]:
+        if not genres:
+            genres = list(self._default_seed_genres)
+
+        artist_ids: List[str] = []
+        for g in genres:
+            g = (g or "").strip()
+            if not g:
+                continue
+            q = f'genre:"{g}"'
+            params = {"q": q, "type": "artist", "limit": 50}
+            params["market"] = market or self.market
+
+            r = self._session.get(
+                f"{self.API_BASE_URL}/search",
+                headers=self._auth_header(),
+                params=params,
+                timeout=10,
+            )
+            if r.status_code == 401:
+                self._refresh_access_token()
+                r = self._session.get(
+                    f"{self.API_BASE_URL}/search",
+                    headers=self._auth_header(),
+                    params=params,
+                    timeout=10,
+                )
+            if r.ok:
+                items = (r.json().get("artists") or {}).get("items") or []
+                for a in items:
+                    aid = a.get("id")
+                    if aid and aid not in artist_ids:
+                        artist_ids.append(aid)
+                        if len(artist_ids) >= limit:
+                            break
+            if len(artist_ids) >= limit:
+                break
+        return artist_ids[:limit]
+
+    def _artist_top_tracks(self, artist_id: str, *, market: Optional[str] = None) -> List[dict]:
+        params = {"market": market or self.market}
+        r = self._session.get(
+            f"{self.API_BASE_URL}/artists/{artist_id}/top-tracks",
+            headers=self._auth_header(),
+            params=params,
+            timeout=10,
+        )
+        if r.status_code == 401:
+            self._refresh_access_token()
+            r = self._session.get(
+                f"{self.API_BASE_URL}/artists/{artist_id}/top-tracks",
+                headers=self._auth_header(),
+                params=params,
+                timeout=10,
+            )
+        if not r.ok:
+            return []
+        data = r.json() or {}
+        tracks = data.get("tracks") or []
+        return tracks
+
+    def _manual_recommendations(
+        self,
+        *,
+        seed_genres: Optional[List[str]],
+        seed_artists: Optional[List[str]],
+        seed_tracks: Optional[List[str]],
+        limit: int,
+        market: Optional[str],
+    ) -> Dict:
+        """
+        Fallback recommender:
+        - Prefer explicit seed_artists -> top-tracks
+        - Else, derive artists from genres and use their top-tracks
+        - Else, search tracks with the first genre keyword
+        """
+        market = market or self.market
+        out_tracks: List[dict] = []
+        seen: Set[str] = set()
+
+        artists = list(seed_artists or [])
+        if not artists:
+            artists = self._seed_artists_from_genres(seed_genres, limit=5, market=market)
+
+        for aid in artists:
+            for t in self._artist_top_tracks(aid, market=market):
+                tid = t.get("id")
+                if not tid or tid in seen:
+                    continue
+                seen.add(tid)
+                out_tracks.append(t)
+                if len(out_tracks) >= limit:
+                    break
+            if len(out_tracks) >= limit:
+                break
+
+        # Last resort: search tracks by genre keyword
+        if len(out_tracks) < limit and seed_genres:
+            q = f'genre:"{seed_genres[0]}"'
+            params = {"q": q, "type": "track", "limit": max(10, limit), "market": market}
+            r = self._session.get(f"{self.API_BASE_URL}/search", headers=self._auth_header(), params=params, timeout=10)
+            if r.ok:
+                items = (r.json().get("tracks") or {}).get("items") or []
+                for t in items:
+                    tid = t.get("id")
+                    if tid and tid not in seen:
+                        seen.add(tid)
+                        out_tracks.append(t)
+                        if len(out_tracks) >= limit:
+                            break
+
+        return {"tracks": out_tracks[:limit]}
+
+    # ---------- Features ----------
+
+    def _prepare_target_features(self, target_features: Dict[str, float]) -> Tuple[Dict[str, str], Dict[str, float]]:
+        applied: Dict[str, float] = {}
+        params: Dict[str, str] = {}
+        if not target_features:
+            return params, applied
+
+        def _clamp(name: str, val: float) -> float:
+            lo, hi = self._FEATURE_LIMITS.get(name, (-1e9, 1e9))
+            return max(lo, min(hi, val))
+
+        for k, v in target_features.items():
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            fv = _clamp(k, fv)
+            params[f"target_{k}"] = str(fv)
+            applied[k] = fv
+        return params, applied
+
+    # ---------- Recommendations (with fallback) ----------
+
     def get_recommendations(
         self,
         *,
         target_features: Dict[str, float],
         seed_genres: Optional[List[str]] = None,
+        seed_tracks: Optional[List[str]] = None,
+        seed_artists: Optional[List[str]] = None,
         limit: int = 5,
         market: Optional[str] = None,
     ) -> Tuple[Dict, Dict[str, float], List[str]]:
-        """Spotify 추천 엔드포인트를 호출하면 됨.
+        # First, try legacy /recommendations once (some old apps still have access)
+        params: Dict[str, str] = {"limit": str(max(1, min(limit, 100)))}  # <=100
+        params["market"] = market or self.market
 
-        Parameters
-        ----------
-        target_features:
-            원하는 오디오 피처 값을 ``feature: value`` 형태로 넘기면 됨.
-            메서드가 자동으로 ``target_`` 접두사를 붙이면 됨.
-        seed_genres:
-            Gemini가 골라준 장르 목록을 최대 5개까지 넣으면 됨.
-        limit:
-            요청할 트랙 수를 정하면 됨(기본 5개).
-        market:
-            필요하다면 ``US``나 ``KR``처럼 마켓 코드를 지정하면 됨.
+        # seed handling
+        seeds_g = self._select_seed_genres(seed_genres)
+        seeds_t = (seed_tracks or [])[:5]
+        seeds_a = (seed_artists or [])[:5]
 
-        Returns
-        -------
-        Tuple[Dict, Dict[str, float], List[str]]
-            Spotify 응답 본문과 함께 적용된 오디오 피처, 실제로 사용된 장르 시드가
-            순서대로 반환되면 됨.
-        """
+        merged = []
+        for bucket in (seeds_t, seeds_a, seeds_g):
+            for s in bucket:
+                if len(merged) < 5:
+                    merged.append(("t" if bucket is seeds_t else "a" if bucket is seeds_a else "g", s))
 
-        params: Dict[str, str] = {"limit": str(limit)}
+        final_tracks = [s for tag, s in merged if tag == "t"]
+        final_artists = [s for tag, s in merged if tag == "a"]
+        final_genres = [s for tag, s in merged if tag == "g"]
 
-        if market:
-            params["market"] = market
+        if final_genres:
+            params["seed_genres"] = ",".join(final_genres)
+        if final_tracks:
+            params["seed_tracks"] = ",".join(final_tracks)
+        if final_artists:
+            params["seed_artists"] = ",".join(final_artists)
 
-        filtered_seed_genres = self._select_seed_genres(seed_genres)
-        if filtered_seed_genres:
-            params["seed_genres"] = ",".join(filtered_seed_genres)
+        feat_params, applied_features = self._prepare_target_features(target_features)
+        params.update(feat_params)
 
-        feature_params, applied_features = self._prepare_target_features(target_features)
-        params.update(feature_params)
+        # Try deprecated endpoint (may work on old apps)
+        url = f"{self.API_BASE_URL}/recommendations"
+        try:
+            r = self._session.get(url, headers=self._auth_header(), params=params, timeout=20)
+            if r.status_code == 401:
+                self._refresh_access_token()
+                r = self._session.get(url, headers=self._auth_header(), params=params, timeout=20)
 
-        response = requests.get(
-            f"{self.API_BASE_URL}/recommendations",
-            headers=self._authorisation_header(),
-            params=params,
-            timeout=15,
-        )
-
-        if response.status_code == 401:
-            # 토큰이 만료되었으니 새로 갱신하고 한 번만 재시도하면 됨
-            self._refresh_access_token()
-            response = requests.get(
-                f"{self.API_BASE_URL}/recommendations",
-                headers=self._authorisation_header(),
-                params=params,
-                timeout=15,
+            if r.status_code in {400, 403, 404}:
+                # Fallback to manual recommender
+                manual = self._manual_recommendations(
+                    seed_genres=final_genres or seed_genres,
+                    seed_artists=final_artists or seed_artists,
+                    seed_tracks=final_tracks or seed_tracks,
+                    limit=limit,
+                    market=market,
+                )
+                return manual, applied_features, final_genres
+            r.raise_for_status()
+            return r.json(), applied_features, final_genres
+        except requests.RequestException:
+            manual = self._manual_recommendations(
+                seed_genres=final_genres or seed_genres,
+                seed_artists=final_artists or seed_artists,
+                seed_tracks=final_tracks or seed_tracks,
+                limit=limit,
+                market=market,
             )
-
-        if response.status_code in {400, 404}:
-            raise SpotifyAuthError(
-                "Spotify 추천 매개변수가 잘못되었으니 장르와 피처 값을 다시 확인하면 됨. "
-                f"(상세: {response.text})"
-            )
-
-        response.raise_for_status()
-        return response.json(), applied_features, filtered_seed_genres
-
-    # ------------------------------------------------------------------
-    # 장르 시드 관련 보조 함수를 정리하면 됨
-    # ------------------------------------------------------------------
-    def _select_seed_genres(self, seed_genres: Optional[List[str]]) -> List[str]:
-        """Spotify에서 허용하는 장르만 골라 쓰면 됨."""
-
-        available = self._get_available_genre_seeds()
-
-        candidates = [
-            genre.strip().lower()
-            for genre in seed_genres or []
-            if genre and genre.strip().lower() in available
-        ]
-
-        if not candidates:
-            candidates = [
-                genre
-                for genre in self._default_seed_genres
-                if genre in available
-            ]
-
-        if not candidates:
-            # 혹시 기본 장르가 모두 사라졌다면 API가 준 목록에서 앞부분만 쓰면 됨
-            candidates = list(available)[:5]
-
-        return candidates[:5]
-
-    def _get_available_genre_seeds(self) -> Set[str]:
-        """Spotify가 지원하는 장르 시드를 캐시해서 쓰면 됨."""
-
-        if self._cached_genre_seeds:
-            return self._cached_genre_seeds
-
-        response = requests.get(
-            f"{self.API_BASE_URL}/recommendations/available-genre-seeds",
-            headers=self._authorisation_header(),
-            timeout=15,
-        )
-
-        if response.status_code == 401:
-            self._refresh_access_token()
-            response = requests.get(
-                f"{self.API_BASE_URL}/recommendations/available-genre-seeds",
-                headers=self._authorisation_header(),
-                timeout=15,
-            )
-
-        response.raise_for_status()
-        payload = response.json()
-        genres = set(payload.get("genres", []))
-
-        if not genres:
-            raise SpotifyAuthError(
-                "Spotify에서 제공하는 장르 시드를 가져오지 못했으니 설정을 확인하면 됨."
-            )
-
-        self._cached_genre_seeds = genres
-        return genres
-
-    # ------------------------------------------------------------------
-    # 피처 값을 Spotify 사양에 맞춰 정리하는 도우미를 추가하면 됨
-    # ------------------------------------------------------------------
-    def _prepare_target_features(
-        self, target_features: Optional[Dict[str, float]]
-    ) -> Tuple[Dict[str, str], Dict[str, float]]:
-        """Spotify 권장 범위에 맞춰 피처 값을 정리하면 됨."""
-
-        params: Dict[str, str] = {}
-        applied: Dict[str, float] = {}
-
-        for feature, raw_value in (target_features or {}).items():
-            if raw_value is None:
-                continue
-
-            try:
-                value = float(raw_value)
-            except (TypeError, ValueError):
-                continue
-
-            minimum, maximum = self.FEATURE_RANGES.get(feature, (-float("inf"), float("inf")))
-            value = max(minimum, min(maximum, value))
-            applied[feature] = value
-            params[f"target_{feature}"] = self._format_feature_value(feature, value)
-
-        return params, applied
-
-    @staticmethod
-    def _format_feature_value(feature: str, value: float) -> str:
-        """Spotify가 기대하는 표현에 맞게 값을 문자열로 변환하면 됨."""
-
-        if feature == "tempo":
-            return str(round(value))
-
-        if feature == "loudness":
-            return f"{value:.2f}"
-
-        formatted = f"{value:.4f}"
-        return formatted.rstrip("0").rstrip(".")
-
+            return manual, applied_features, final_genres
