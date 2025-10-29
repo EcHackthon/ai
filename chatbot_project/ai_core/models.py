@@ -20,7 +20,10 @@ class Track:
 
 @dataclass(frozen=True)
 class RecommendationResult:
-    """Spotify 추천 결과와 관련 정보를 함께 보관하면 됨."""
+    """Spotify 추천 결과와 관련 정보를 함께 보관하면 됨.
+
+    ``features`` 필드에는 Spotify 문서에서 권장한 범위로 정리된 값이 들어있으면 됨.
+    """
 
     features: Dict[str, float]
     genres: List[str]

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -21,14 +21,29 @@ class SpotifyClient:
     TOKEN_URL = "https://accounts.spotify.com/api/token"
     API_BASE_URL = "https://api.spotify.com/v1"
 
+    # Spotify 문서에 명시된 오디오 피처 값 범위를 정리해두면 됨.
+    FEATURE_RANGES: Dict[str, Tuple[float, float]] = {
+        "acousticness": (0.0, 1.0),
+        "danceability": (0.0, 1.0),
+        "energy": (0.0, 1.0),
+        "instrumentalness": (0.0, 1.0),
+        "liveness": (0.0, 1.0),
+        "speechiness": (0.0, 1.0),
+        "valence": (0.0, 1.0),
+        "tempo": (0.0, 250.0),
+        "loudness": (-60.0, 0.0),
+    }
+
     def __init__(self, settings: Settings):
         self._client_id = settings.spotify_client_id
         self._client_secret = settings.spotify_client_secret
         self._refresh_token = settings.spotify_refresh_token
         self._redirect_uri = settings.spotify_redirect_uri
+        self._default_seed_genres = settings.spotify_default_seed_genres
 
         self._access_token: Optional[str] = None
         self._token_expiry: float = 0.0
+        self._cached_genre_seeds: Optional[Set[str]] = None
 
     # ------------------------------------------------------------------
     # 인증 보조 함수는 이렇게 묶으면 됨
@@ -85,7 +100,7 @@ class SpotifyClient:
         seed_genres: Optional[List[str]] = None,
         limit: int = 5,
         market: Optional[str] = None,
-    ) -> Dict:
+    ) -> Tuple[Dict, Dict[str, float], List[str]]:
         """Spotify 추천 엔드포인트를 호출하면 됨.
 
         Parameters
@@ -99,6 +114,12 @@ class SpotifyClient:
             요청할 트랙 수를 정하면 됨(기본 5개).
         market:
             필요하다면 ``US``나 ``KR``처럼 마켓 코드를 지정하면 됨.
+
+        Returns
+        -------
+        Tuple[Dict, Dict[str, float], List[str]]
+            Spotify 응답 본문과 함께 적용된 오디오 피처, 실제로 사용된 장르 시드가
+            순서대로 반환되면 됨.
         """
 
         params: Dict[str, str] = {"limit": str(limit)}
@@ -106,12 +127,12 @@ class SpotifyClient:
         if market:
             params["market"] = market
 
-        if seed_genres:
-            params["seed_genres"] = ",".join(seed_genres[:5])
+        filtered_seed_genres = self._select_seed_genres(seed_genres)
+        if filtered_seed_genres:
+            params["seed_genres"] = ",".join(filtered_seed_genres)
 
-        for feature, value in target_features.items():
-            # Spotify에서는 ``target_<feature>`` 형태로 보내면 됨
-            params[f"target_{feature}"] = str(value)
+        feature_params, applied_features = self._prepare_target_features(target_features)
+        params.update(feature_params)
 
         response = requests.get(
             f"{self.API_BASE_URL}/recommendations",
@@ -130,6 +151,111 @@ class SpotifyClient:
                 timeout=15,
             )
 
+        if response.status_code in {400, 404}:
+            raise SpotifyAuthError(
+                "Spotify 추천 매개변수가 잘못되었으니 장르와 피처 값을 다시 확인하면 됨. "
+                f"(상세: {response.text})"
+            )
+
         response.raise_for_status()
-        return response.json()
+        return response.json(), applied_features, filtered_seed_genres
+
+    # ------------------------------------------------------------------
+    # 장르 시드 관련 보조 함수를 정리하면 됨
+    # ------------------------------------------------------------------
+    def _select_seed_genres(self, seed_genres: Optional[List[str]]) -> List[str]:
+        """Spotify에서 허용하는 장르만 골라 쓰면 됨."""
+
+        available = self._get_available_genre_seeds()
+
+        candidates = [
+            genre.strip().lower()
+            for genre in seed_genres or []
+            if genre and genre.strip().lower() in available
+        ]
+
+        if not candidates:
+            candidates = [
+                genre
+                for genre in self._default_seed_genres
+                if genre in available
+            ]
+
+        if not candidates:
+            # 혹시 기본 장르가 모두 사라졌다면 API가 준 목록에서 앞부분만 쓰면 됨
+            candidates = list(available)[:5]
+
+        return candidates[:5]
+
+    def _get_available_genre_seeds(self) -> Set[str]:
+        """Spotify가 지원하는 장르 시드를 캐시해서 쓰면 됨."""
+
+        if self._cached_genre_seeds:
+            return self._cached_genre_seeds
+
+        response = requests.get(
+            f"{self.API_BASE_URL}/recommendations/available-genre-seeds",
+            headers=self._authorisation_header(),
+            timeout=15,
+        )
+
+        if response.status_code == 401:
+            self._refresh_access_token()
+            response = requests.get(
+                f"{self.API_BASE_URL}/recommendations/available-genre-seeds",
+                headers=self._authorisation_header(),
+                timeout=15,
+            )
+
+        response.raise_for_status()
+        payload = response.json()
+        genres = set(payload.get("genres", []))
+
+        if not genres:
+            raise SpotifyAuthError(
+                "Spotify에서 제공하는 장르 시드를 가져오지 못했으니 설정을 확인하면 됨."
+            )
+
+        self._cached_genre_seeds = genres
+        return genres
+
+    # ------------------------------------------------------------------
+    # 피처 값을 Spotify 사양에 맞춰 정리하는 도우미를 추가하면 됨
+    # ------------------------------------------------------------------
+    def _prepare_target_features(
+        self, target_features: Optional[Dict[str, float]]
+    ) -> Tuple[Dict[str, str], Dict[str, float]]:
+        """Spotify 권장 범위에 맞춰 피처 값을 정리하면 됨."""
+
+        params: Dict[str, str] = {}
+        applied: Dict[str, float] = {}
+
+        for feature, raw_value in (target_features or {}).items():
+            if raw_value is None:
+                continue
+
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+
+            minimum, maximum = self.FEATURE_RANGES.get(feature, (-float("inf"), float("inf")))
+            value = max(minimum, min(maximum, value))
+            applied[feature] = value
+            params[f"target_{feature}"] = self._format_feature_value(feature, value)
+
+        return params, applied
+
+    @staticmethod
+    def _format_feature_value(feature: str, value: float) -> str:
+        """Spotify가 기대하는 표현에 맞게 값을 문자열로 변환하면 됨."""
+
+        if feature == "tempo":
+            return str(round(value))
+
+        if feature == "loudness":
+            return f"{value:.2f}"
+
+        formatted = f"{value:.4f}"
+        return formatted.rstrip("0").rstrip(".")
 

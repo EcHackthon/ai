@@ -29,6 +29,7 @@ SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
 SPOTIFY_REFRESH_TOKEN=optional_refresh_token
 SPOTIFY_REDIRECT_URI=https://example.com/callback
 SPOTIFY_MARKET=KR  # 기본값은 US
+SPOTIFY_DEFAULT_SEED_GENRES=pop,dance-pop  # Spotify에서 제공하는 장르 시드만 넣으면 됨
 GEMINI_MODEL=gemini-2.0-flash-exp
 ```
 
@@ -90,7 +91,8 @@ chatbot_project/
 ```
 
 각 모듈은 객체지향적으로 구성되어 있어 다른 인터페이스(예: FastAPI, Flask,
-웹소켓)로 확장하기 쉽습니다.
+웹소켓)로 확장하기 쉽습니다. Spotify 권장 사양에 맞춰 오디오 피처 값은 자동으로
+클램핑(clamping)되며, 실제로 사용된 장르 시드만 결과에 남도록 정리됩니다.
 
 ## 최근 변경 사항
 
@@ -100,6 +102,10 @@ chatbot_project/
   `.env`에만 채우면 됨.
 - Gemini 호출이 실패했을 때 사용자에게 바로 알려주고 재시도하면 되도록
   예외 처리를 넣었고, CLI에서 `--limit` 옵션으로 추천 곡 수를 조절하면 됨.
+- Spotify 추천은 허용된 장르 시드만 자동으로 선택하고, Spotify 문서에 나온 범위로
+  오디오 피처를 정규화해서 호출하므로 404 오류나 잘못된 요청을 예방하면 됨.
+  `.env`의 `SPOTIFY_DEFAULT_SEED_GENRES`에는 `available-genre-seeds` API에서 제공하는
+  값만 넣으면 됨.
 
 ## 테스트 방법
 

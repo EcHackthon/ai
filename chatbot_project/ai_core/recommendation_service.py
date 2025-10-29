@@ -33,7 +33,7 @@ class RecommendationService:
 
         limit = limit or self._default_limit
 
-        raw_response = self._spotify_client.get_recommendations(
+        raw_response, applied_features, used_genres = self._spotify_client.get_recommendations(
             target_features=target_features,
             seed_genres=genres,
             limit=limit,
@@ -55,8 +55,8 @@ class RecommendationService:
             )
 
         return RecommendationResult(
-            features=target_features,
-            genres=genres or [],
+            features=applied_features,
+            genres=used_genres,
             tracks=tracks,
             raw_response=raw_response,
         )
