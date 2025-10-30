@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from statistics import mean
 from typing import Dict, List, Optional
 
 from .models import RecommendationResult, Track, track_to_payload
@@ -33,15 +34,31 @@ class RecommendationService:
 
         limit = limit or self._default_limit
 
+        inferred_genres = [genre for genre in (genres or []) if genre]
+
         raw_response, applied_features, used_genres = self._spotify_client.get_recommendations(
             target_features=target_features,
-            seed_genres=genres,
+            seed_genres=inferred_genres,
             limit=limit,
             market=self._market,
         )
 
         tracks: List[Track] = []
-        for item in raw_response.get("tracks", []):
+        original_tracks = raw_response.get("tracks", [])
+        raw_tracks = [
+            item
+            for item in original_tracks
+            if item.get("popularity", 0) >= 35
+        ]
+        if not raw_tracks:
+            raw_tracks = original_tracks
+
+        audio_features_map = {}
+        track_ids = [item.get("id") for item in raw_tracks if item.get("id")]
+        if track_ids:
+            audio_features_map = self._spotify_client.get_audio_features(track_ids)
+
+        for item in raw_tracks:
             album_images = item.get("album", {}).get("images", [])
             tracks.append(
                 Track(
@@ -49,14 +66,15 @@ class RecommendationService:
                     name=item["name"],
                     artists=[artist["name"] for artist in item.get("artists", [])],
                     external_url=item.get("external_urls", {}).get("spotify", ""),
-                    preview_url=item.get("preview_url"),
                     album_image=album_images[0]["url"] if album_images else None,
+                    audio_features=audio_features_map.get(item["id"]),
                 )
             )
 
         return RecommendationResult(
             features=applied_features,
-            genres=used_genres,
+            seed_genres=used_genres,
+            inferred_genres=inferred_genres,
             tracks=tracks,
             raw_response=raw_response,
         )
@@ -65,10 +83,24 @@ class RecommendationService:
     def build_backend_payload(result: RecommendationResult) -> Dict:
         """백엔드에 전달하기 좋은 페이로드를 만들면 됨."""
 
-        return {
+        payload = {
             "provider": "spotify",
-            "audio_features": result.features,
-            "genres": result.genres,
+            "audio_profile": result.features,
+            "inferred_genres": result.inferred_genres,
+            "seed_genres": result.seed_genres,
             "tracks": [track_to_payload(track) for track in result.tracks],
         }
+
+        track_features = [track.audio_features for track in result.tracks if track.audio_features]
+        if track_features:
+            aggregated: Dict[str, float] = {}
+            for feature_name in track_features[0].keys():
+                values = [features.get(feature_name) for features in track_features if feature_name in features]
+                numeric_values = [value for value in values if isinstance(value, (int, float))]
+                if numeric_values:
+                    aggregated[feature_name] = float(mean(numeric_values))
+            if aggregated:
+                payload["audio_features_summary"] = aggregated
+
+        return payload
 

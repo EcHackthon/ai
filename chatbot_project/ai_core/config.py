@@ -25,7 +25,7 @@ class Settings:
     spotify_refresh_token: Optional[str] = None
     spotify_redirect_uri: Optional[str] = None
     spotify_market: str = "US"
-    spotify_default_seed_genres: Tuple[str, ...] = ("pop",)
+    spotify_default_seed_genres: Tuple[str, ...] = tuple()
     gemini_model: str = "gemini-2.0-flash-exp"
 
     @classmethod
@@ -45,15 +45,16 @@ class Settings:
                 " SPOTIFY_CLIENT_ID와 SPOTIFY_CLIENT_SECRET을 설정하면 됨."
             )
 
-        default_seed_raw = os.getenv("SPOTIFY_DEFAULT_SEED_GENRES", "pop")
+        default_seed_raw = os.getenv("SPOTIFY_DEFAULT_SEED_GENRES", "")
         default_seed_genres = tuple(
             genre.lower()
             for genre in (
                 candidate.strip()
                 for candidate in default_seed_raw.split(",")
+                if candidate
             )
             if genre
-        ) or ("pop",)
+        )
 
         return cls(
             gemini_api_key=gemini_api_key,

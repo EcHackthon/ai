@@ -21,8 +21,15 @@ def _print_recommendations(payload: dict) -> None:
         print(f"{idx}. {track['name']} - {artists}")
         if track.get("url"):
             print(f"   🔗 {track['url']}")
-        if track.get("preview_url"):
-            print(f"   🎵 Preview: {track['preview_url']}")
+        features = track.get("audio_features")
+        if isinstance(features, dict) and features:
+            readable = ", ".join(
+                f"{key}: {round(value, 2)}"
+                for key, value in features.items()
+                if isinstance(value, (int, float))
+            )
+            if readable:
+                print(f"   🎚️ {readable}")
     print("-" * 40)
 
 
