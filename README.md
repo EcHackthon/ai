@@ -70,16 +70,24 @@ REST API나 메시지 큐에 전달하면 됩니다. 구조는 다음과 같습�
 ```json
 {
   "provider": "spotify",
-  "audio_features": {"energy": 0.8, "tempo": 120},
-  "genres": ["pop"],
+  "audio_profile": {"energy": 0.8, "tempo": 120},
+  "audio_features_summary": {"danceability": 0.73, "energy": 0.81},
+  "inferred_genres": ["pop", "k-pop"],
+  "seed_genres": ["pop"],
   "tracks": [
     {
       "id": "123",
       "name": "Song",
       "artists": ["Artist"],
       "url": "https://open.spotify.com/track/123",
-      "preview_url": "https://p.scdn.co/mp3-preview/...",
-      "album_image": "https://i.scdn.co/image/..."
+      "album_image": "https://i.scdn.co/image/...",
+      "audio_features": {
+        "acousticness": 0.12,
+        "danceability": 0.74,
+        "energy": 0.86,
+        "tempo": 122.04,
+        "valence": 0.55
+      }
     }
   ]
 }
