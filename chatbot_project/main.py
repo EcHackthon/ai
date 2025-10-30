@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import requests
 import argparse
 import json
 from typing import Optional
@@ -76,6 +77,16 @@ def run_cli(limit: Optional[int] = None) -> None:
 
         print("\n백엔드 전송용 JSON:")
         print(json.dumps(payload, indent=2, ensure_ascii=False))
+        try:
+            response = requests.post(
+                "http://localhost:4000/api/recommend",
+                json=payload,
+                timeout=5
+            )
+            print("✅ 백엔드로 전송 성공:", response.status_code)
+            print("백엔드 응답:", response.json())
+        except Exception as exc:
+            print("❌ 백엔드 전송 실패:", exc)
 
 
 def parse_args() -> argparse.Namespace:
