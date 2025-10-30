@@ -21,8 +21,28 @@ def _print_recommendations(payload: dict) -> None:
         print(f"{idx}. {track['name']} - {artists}")
         if track.get("url"):
             print(f"   🔗 {track['url']}")
-        if track.get("preview_url"):
-            print(f"   🎵 Preview: {track['preview_url']}")
+        if track.get("popularity") is not None:
+            print(f"   ⭐ Popularity: {track['popularity']}")
+        features = track.get("audio_features")
+        if isinstance(features, dict) and features:
+            readable = ", ".join(
+                f"{key}: {round(value, 2)}"
+                for key, value in features.items()
+                if isinstance(value, (int, float))
+            )
+            if readable:
+                print(f"   🎚️ {readable}")
+        targets = track.get("target_features")
+        if isinstance(targets, dict) and targets:
+            readable = ", ".join(
+                f"{key}: {round(value, 2)}"
+                for key, value in targets.items()
+                if isinstance(value, (int, float))
+            )
+            if readable:
+                print(f"   🎯 Target: {readable}")
+        if track.get("seed_artists"):
+            print(f"   👥 Seed artists: {', '.join(track['seed_artists'])}")
     print("-" * 40)
 
 
@@ -67,6 +87,7 @@ def run_cli(limit: Optional[int] = None) -> None:
             recommendation_result = recommendation_service.recommend(
                 target_features=gemini_response.target_features,
                 genres=gemini_response.genres,
+                artists=gemini_response.artists,
             )
         except SpotifyAuthError as exc:
             print(f"❌ Spotify 인증 오류: {exc}")

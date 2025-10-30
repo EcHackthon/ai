@@ -24,6 +24,7 @@ class GeminiResponse:
     message: str
     target_features: Optional[Dict[str, float]] = None
     genres: List[str] = field(default_factory=list)
+    artists: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -31,6 +32,7 @@ class GeminiResponse:
             "message": self.message,
             "target_features": self.target_features,
             "genres": self.genres or [],
+            "artists": self.artists or [],
         }
 
 
@@ -47,6 +49,7 @@ class GeminiMusicChat:
         self.analysis_ready = False
         self.target_features: Optional[Dict[str, float]] = None
         self.target_genres: List[str] = []
+        self.target_artists: List[str] = []
 
         genai.configure(api_key=self._api_key)
 
@@ -63,6 +66,7 @@ class GeminiMusicChat:
         self.analysis_ready = False
         self.target_features = None
         self.target_genres = []
+        self.target_artists = []
         self._chat = self._model.start_chat(history=[])
 
     # ------------------------------------------------------------------
@@ -92,6 +96,12 @@ class GeminiMusicChat:
             self.analysis_ready = True
             self.target_features = analysis_payload.get("target_features")
             self.target_genres = analysis_payload.get("genres", [])
+            target_artists = analysis_payload.get("artists") or []
+            self.target_artists = [
+                artist
+                for artist in (target_artists if isinstance(target_artists, list) else [])
+                if isinstance(artist, str) and artist.strip()
+            ]
 
             clean_message = self._strip_json_block(bot_message).strip() or (
                 "분석이 완료되었습니다! 잠시 후 추천을 준비할게요."
@@ -102,6 +112,7 @@ class GeminiMusicChat:
                 message=clean_message,
                 target_features=self.target_features,
                 genres=self.target_genres,
+                artists=self.target_artists,
             )
 
         clean_message = self._strip_json_block(bot_message).strip() or bot_message
@@ -136,5 +147,6 @@ class GeminiMusicChat:
         return {
             "target_features": self.target_features,
             "genres": self.target_genres,
+            "artists": getattr(self, "target_artists", []),
         }
 

@@ -44,7 +44,8 @@ if (중간에 노래를 빨리 추천해 달라는 경우) {
     "tempo": 120,
     "loudness": -5.0
   },
-  "genres": ["pop", "k-pop", "dance"]
+  "genres": ["pop", "k-pop", "dance"],
+  "artists": ["BLACKPINK", "NewJeans"]
 }
 ```
 
@@ -109,7 +110,8 @@ if (중간에 노래를 빨리 추천해 달라는 경우) {
     "tempo": 80,
     "loudness": -10
   },
-  "genres": ["indie", "acoustic", "sad"]
+  "genres": ["indie", "acoustic", "sad"],
+  "artists": []
 }
 
 운동할 때:
@@ -124,7 +126,8 @@ if (중간에 노래를 빨리 추천해 달라는 경우) {
     "tempo": 140,
     "loudness": -4
   },
-  "genres": ["edm", "hip-hop", "workout"]
+  "genres": ["edm", "hip-hop", "workout"],
+  "artists": ["David Guetta"]
 }
 
 공부할 때:
@@ -139,7 +142,8 @@ if (중간에 노래를 빨리 추천해 달라는 경우) {
     "tempo": 90,
     "loudness": -15
   },
-  "genres": ["classical", "ambient", "study"]
+  "genres": ["classical", "ambient", "study"],
+  "artists": []
 }
 
 파티할 때:
@@ -154,7 +158,8 @@ if (중간에 노래를 빨리 추천해 달라는 경우) {
     "tempo": 128,
     "loudness": -3
   },
-  "genres": ["dance", "pop", "party"]
+  "genres": ["dance", "pop", "party"],
+  "artists": ["Calvin Harris"]
 }
 
 잠들기 전:
@@ -169,7 +174,8 @@ if (중간에 노래를 빨리 추천해 달라는 경우) {
     "tempo": 60,
     "loudness": -20
   },
-  "genres": ["ambient", "sleep", "relaxing"]
+  "genres": ["ambient", "sleep", "relaxing"],
+  "artists": []
 }
 
 아직 정보가 부족하면:
@@ -191,7 +197,8 @@ if (중간에 노래를 빨리 추천해 달라는 경우) {
     "tempo": 60,
     "loudness": -20
   },
-  "genres": ["ambient", "sleep", "relaxing"]
+  "genres": ["ambient", "sleep", "relaxing"],
+  "artists": []
 }
 ```
 형식과 같은 JSON을 다시 반환하세요.
@@ -205,6 +212,7 @@ if (중간에 노래를 빨리 추천해 달라는 경우) {
 - 노래를 뽑을때, 각각의 target_features 가 다르게 나와야 됨. (이 말이 타겟 특성들의 값들이 어느 범위 사이에서 다양하게 뽑아주면 좋을 것 같다 이말임.)
 - 결론은 장르는 물어보되, spotify api 에 맞춰서 에측해서 장르를 넘기지 말고 (2024에서 멈춤)
 장르는 유추해서 적는 걸로,
+- 아티스트를 특정한 경우 JSON의 "artists" 배열에 해당 이름을 담고, 없다면 빈 배열을 넣으세요.
 
 
 """

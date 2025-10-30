@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import os
 
@@ -25,7 +25,6 @@ class Settings:
     spotify_refresh_token: Optional[str] = None
     spotify_redirect_uri: Optional[str] = None
     spotify_market: str = "US"
-    spotify_default_seed_genres: Tuple[str, ...] = ("pop",)
     gemini_model: str = "gemini-2.0-flash-exp"
 
     @classmethod
@@ -45,16 +44,6 @@ class Settings:
                 " SPOTIFY_CLIENT_ID와 SPOTIFY_CLIENT_SECRET을 설정하면 됨."
             )
 
-        default_seed_raw = os.getenv("SPOTIFY_DEFAULT_SEED_GENRES", "pop")
-        default_seed_genres = tuple(
-            genre.lower()
-            for genre in (
-                candidate.strip()
-                for candidate in default_seed_raw.split(",")
-            )
-            if genre
-        ) or ("pop",)
-
         return cls(
             gemini_api_key=gemini_api_key,
             spotify_client_id=spotify_client_id,
@@ -63,6 +52,5 @@ class Settings:
             spotify_redirect_uri=os.getenv("SPOTIFY_REDIRECT_URI"),
             spotify_market=os.getenv("SPOTIFY_MARKET", "US"),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp"),
-            spotify_default_seed_genres=default_seed_genres,
         )
 

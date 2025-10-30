@@ -14,8 +14,12 @@ class Track:
     name: str
     artists: List[str]
     external_url: str
-    preview_url: Optional[str]
     album_image: Optional[str]
+    audio_features: Optional[Dict[str, float]] = None
+    popularity: Optional[int] = None
+    target_features: Dict[str, float] = field(default_factory=dict)
+    seed_artists: List[str] = field(default_factory=list)
+    seed_tracks: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -26,20 +30,36 @@ class RecommendationResult:
     """
 
     features: Dict[str, float]
-    genres: List[str]
+    seed_genres: List[str]
+    inferred_genres: List[str]
     tracks: List[Track] = field(default_factory=list)
-    raw_response: Dict[str, Any] = field(default_factory=dict)
+    feature_plan: List[Dict[str, float]] = field(default_factory=list)
+    requested_artists: List[str] = field(default_factory=list)
+    seed_artists: List[str] = field(default_factory=list)
+    seed_tracks: List[str] = field(default_factory=list)
+    raw_responses: List[Dict[str, Any]] = field(default_factory=list)
 
 
-def track_to_payload(track: Track) -> Dict[str, Optional[str]]:
+def track_to_payload(track: Track) -> Dict[str, Any]:
     """``Track`` 데이터를 직렬화 가능한 딕셔너리로 바꾸면 됨."""
 
-    return {
+    payload: Dict[str, Any] = {
         "id": track.id,
         "name": track.name,
         "artists": track.artists,
         "url": track.external_url,
-        "preview_url": track.preview_url,
         "album_image": track.album_image,
     }
+    if track.popularity is not None:
+        payload["popularity"] = track.popularity
+    if track.audio_features is not None:
+        payload["audio_features"] = track.audio_features
+    if track.target_features:
+        payload["target_features"] = track.target_features
+    if track.seed_artists:
+        payload["seed_artists"] = track.seed_artists
+    if track.seed_tracks:
+        payload["seed_tracks"] = track.seed_tracks
+
+    return payload
 

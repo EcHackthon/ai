@@ -35,10 +35,6 @@ SPOTIFY_REDIRECT_URI=https://example.com/callback
 
 SPOTIFY_MARKET=KR  # 기본값은 US
 
-SPOTIFY_DEFAULT_SEED_GENRES=pop,dance-pop  
-# Spotify에서 제공하는 장르 시드만 넣으면 됨
-# 2024이후 Spotify 는 자체적으로 genre 를 넘겨주는 api를 파기함.
-
 GEMINI_MODEL=gemini-2.0-flash-exp
 ```
 
@@ -70,16 +66,39 @@ REST API나 메시지 큐에 전달하면 됩니다. 구조는 다음과 같습�
 ```json
 {
   "provider": "spotify",
-  "audio_features": {"energy": 0.8, "tempo": 120},
-  "genres": ["pop"],
+  "audio_profile": {"energy": 0.8, "tempo": 120, "danceability": 0.72},
+  "feature_plan": [
+    {"energy": 0.83, "tempo": 126, "danceability": 0.77},
+    {"energy": 0.74, "tempo": 118, "valence": 0.66}
+  ],
+  "audio_features_summary": {"danceability": 0.73, "energy": 0.81},
+  "inferred_genres": ["pop", "k-pop"],
+  "seed_genres": ["pop", "dance"],
+  "seed_artists": ["LE SSERAFIM"],
+  "seed_tracks": ["4y0m2lRz..."],
+  "requested_artists": ["LE SSERAFIM"],
   "tracks": [
     {
       "id": "123",
       "name": "Song",
       "artists": ["Artist"],
       "url": "https://open.spotify.com/track/123",
-      "preview_url": "https://p.scdn.co/mp3-preview/...",
-      "album_image": "https://i.scdn.co/image/..."
+      "album_image": "https://i.scdn.co/image/...",
+      "popularity": 72,
+      "audio_features": {
+        "acousticness": 0.12,
+        "danceability": 0.74,
+        "energy": 0.86,
+        "tempo": 122.04,
+        "valence": 0.55
+      },
+      "target_features": {
+        "energy": 0.83,
+        "danceability": 0.78,
+        "tempo": 128
+      },
+      "seed_artists": ["LE SSERAFIM"],
+      "seed_tracks": []
     }
   ]
 }
@@ -103,8 +122,9 @@ chatbot_project/
 각 모듈은 객체지향적으로 구성되어 있어 다른 인터페이스
 (예: FastAPI, Flask,웹소켓) 로 확장하기 쉽습니다.
 Spotify 권장 사양에 맞춰 오디오 피처 값은 자동으로
-클램핑(clamping)되며,  실제로 사용된 장르 시드만 결과에 
-남도록 정리됩니다.
+클램핑(clamping)되며, 호출마다 서로 다른 타깃 피처를 적용해
+획득한 곡과 시드 정보, 요청한 아티스트 메타데이터를 모두
+백엔드로 전달할 수 있습니다.
 
 ## 최근 변경 사항
 
@@ -118,8 +138,8 @@ Spotify 권장 사양에 맞춰 오디오 피처 값은 자동으로
 ### 251030
 - Spotify 추천은 허용된 장르 시드만 자동으로 선택하고, Spotify 문서에 나온 범위로
   오디오 피처를 정규화해서 호출하므로 404 오류나 잘못된 요청을 예방하면 됨.
-  `.env`의 `SPOTIFY_DEFAULT_SEED_GENRES`에는 `available-genre-seeds` API에서 제공하는
-  값만 넣으면 됨.
+- 2024 이후 Spotify 웹 API가 노출하지 않는 preview/genre 필드를 직접 사용하지 않고,
+  추론한 장르와 실제 사용한 시드/아티스트 정보를 별도로 기록해 백엔드에서 활용하면 됨.
 
 ## 테스트 방법
 

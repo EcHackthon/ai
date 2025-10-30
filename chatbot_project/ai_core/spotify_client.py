@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Dict, List, Optional, Tuple, Set, Any
+from typing import Dict, List, Optional, Set, Any
 
 import requests
 
@@ -79,15 +79,31 @@ class SpotifyClient:
         mkt = market.strip() if isinstance(market, str) and market.strip() else None
 
         # settings
+        user_refresh_token: Optional[str] = None
+        redirect_uri: Optional[str] = None
         if settings is not None:
             cid = cid or _pull(settings, "spotify_client_id", "SPOTIFY_CLIENT_ID", "client_id")
             csec = csec or _pull(settings, "spotify_client_secret", "SPOTIFY_CLIENT_SECRET", "client_secret")
             mkt = mkt or _pull(settings, "spotify_market", "SPOTIFY_MARKET", "market")
+            user_refresh_token = user_refresh_token or _pull(
+                settings,
+                "spotify_refresh_token",
+                "SPOTIFY_REFRESH_TOKEN",
+                "refresh_token",
+            )
+            redirect_uri = redirect_uri or _pull(
+                settings,
+                "spotify_redirect_uri",
+                "SPOTIFY_REDIRECT_URI",
+                "redirect_uri",
+            )
 
         # env
         cid = cid or os.getenv("SPOTIFY_CLIENT_ID")
         csec = csec or os.getenv("SPOTIFY_CLIENT_SECRET")
         mkt = mkt or os.getenv("SPOTIFY_MARKET") or "KR"
+        user_refresh_token = user_refresh_token or os.getenv("SPOTIFY_REFRESH_TOKEN")
+        redirect_uri = redirect_uri or os.getenv("SPOTIFY_REDIRECT_URI")
 
         if not cid or not csec:
             raise SpotifyAuthError("SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET 누락")
@@ -100,6 +116,12 @@ class SpotifyClient:
         self._access_token: Optional[str] = None
         self._token_expiry: float = 0.0
 
+        self._token_source: str = "client"
+        self._user_refresh_token: Optional[str] = user_refresh_token if user_refresh_token else None
+        self._redirect_uri: Optional[str] = redirect_uri if redirect_uri else None
+        if self._user_refresh_token:
+            self._token_source = "user"
+
         self._cached_genre_seeds: Set[str] = set()
         self._default_seed_genres: Set[str] = set(self.DEFAULT_SEED_GENRES)
 
@@ -108,7 +130,17 @@ class SpotifyClient:
     # ---------- Auth ----------
 
     def _obtain_access_token(self) -> None:
-        data = {"grant_type": "client_credentials"}
+        if self._token_source == "user" and self._user_refresh_token:
+            data = {
+                "grant_type": "refresh_token",
+                "refresh_token": self._user_refresh_token,
+            }
+            if self._redirect_uri:
+                data["redirect_uri"] = self._redirect_uri
+        else:
+            data = {"grant_type": "client_credentials"}
+            self._token_source = "client"
+
         resp = self._session.post(
             self.TOKEN_URL,
             data=data,
@@ -121,12 +153,22 @@ class SpotifyClient:
                 j = resp.json()
                 if j.get("error") == "invalid_client":
                     hint = " (invalid_client: Client ID/Secret 재확인/재발급 필요)"
+                if j.get("error") == "invalid_grant" and self._token_source == "user":
+                    hint = " (invalid_grant: refresh token 만료, 클라이언트 크레덴셜로 전환함)"
             except Exception:
                 pass
+            if self._token_source == "user":
+                self._token_source = "client"
+                self._user_refresh_token = None
+                self._obtain_access_token()
+                return
             raise SpotifyAuthError(f"토큰 발급 실패: {resp.status_code} {resp.text}{hint}")
         payload = resp.json()
         self._access_token = payload["access_token"]
         self._token_expiry = time.time() + int(payload.get("expires_in", 3600)) - 60
+        if payload.get("refresh_token"):
+            self._user_refresh_token = payload.get("refresh_token")
+            self._token_source = "user"
 
     def _refresh_access_token(self) -> None:
         if self._access_token is None or time.time() >= self._token_expiry:
@@ -135,6 +177,37 @@ class SpotifyClient:
     def _auth_header(self) -> Dict[str, str]:
         self._refresh_access_token()
         return {"Authorization": f"Bearer {self._access_token}"}
+
+    # ---------- User token helpers ----------
+
+    def apply_user_token(
+        self,
+        *,
+        access_token: str,
+        expires_in: int,
+        refresh_token: Optional[str] = None,
+    ) -> None:
+        """외부 OAuth 연동 결과를 적용하면 됨."""
+
+        if not access_token:
+            raise SpotifyAuthError("유효한 사용자 액세스 토큰이 필요함")
+
+        self._access_token = access_token
+        self._token_expiry = time.time() + max(int(expires_in or 0), 60) - 60
+        if refresh_token:
+            self._user_refresh_token = refresh_token
+        if self._user_refresh_token:
+            self._token_source = "user"
+        else:
+            self._token_source = "client"
+
+    def clear_user_token(self) -> None:
+        """사용자 토큰 없이 클라이언트 크레덴셜로 전환하면 됨."""
+
+        self._token_source = "client"
+        self._user_refresh_token = None
+        self._access_token = None
+        self._token_expiry = 0.0
 
     # ---------- Genres ----------
 
@@ -171,6 +244,65 @@ class SpotifyClient:
         return filtered[:5]
 
     # ---------- Fallback helpers ----------
+
+    def resolve_artist_ids(
+        self,
+        artist_names: List[str],
+        *,
+        limit_per_artist: int = 1,
+        market: Optional[str] = None,
+    ) -> List[Dict[str, str]]:
+        """사용자가 입력한 아티스트 이름을 Spotify ID로 변환하면 됨."""
+
+        resolved: List[Dict[str, str]] = []
+        seen_ids: Set[str] = set()
+        for raw_name in artist_names:
+            if not isinstance(raw_name, str):
+                continue
+            name = raw_name.strip()
+            if not name:
+                continue
+
+            params = {
+                "q": name,
+                "type": "artist",
+                "limit": max(1, min(limit_per_artist, 5)),
+            }
+            params["market"] = market or self.market
+
+            try:
+                response = self._session.get(
+                    f"{self.API_BASE_URL}/search",
+                    headers=self._auth_header(),
+                    params=params,
+                    timeout=10,
+                )
+                if response.status_code == 401:
+                    self._refresh_access_token()
+                    response = self._session.get(
+                        f"{self.API_BASE_URL}/search",
+                        headers=self._auth_header(),
+                        params=params,
+                        timeout=10,
+                    )
+                if not response.ok:
+                    continue
+                payload = response.json() or {}
+            except requests.RequestException:
+                continue
+
+            for item in (payload.get("artists") or {}).get("items", []) or []:
+                artist_id = item.get("id")
+                if not artist_id or artist_id in seen_ids:
+                    continue
+                resolved.append({
+                    "id": artist_id,
+                    "name": item.get("name") or name,
+                })
+                seen_ids.add(artist_id)
+                break
+
+        return resolved
 
     def _seed_artists_from_genres(
         self,
@@ -217,7 +349,7 @@ class SpotifyClient:
                 break
         return artist_ids[:limit]
 
-    def _artist_top_tracks(self, artist_id: str, *, market: Optional[str] = None) -> List[dict]:
+    def get_artist_top_tracks(self, artist_id: str, *, market: Optional[str] = None) -> List[dict]:
         params = {"market": market or self.market}
         r = self._session.get(
             f"{self.API_BASE_URL}/artists/{artist_id}/top-tracks",
@@ -263,7 +395,7 @@ class SpotifyClient:
             artists = self._seed_artists_from_genres(seed_genres, limit=5, market=market)
 
         for aid in artists:
-            for t in self._artist_top_tracks(aid, market=market):
+            for t in self.get_artist_top_tracks(aid, market=market):
                 tid = t.get("id")
                 if not tid or tid in seen:
                     continue
@@ -326,7 +458,7 @@ class SpotifyClient:
         seed_artists: Optional[List[str]] = None,
         limit: int = 5,
         market: Optional[str] = None,
-    ) -> Tuple[Dict, Dict[str, float], List[str]]:
+    ) -> Tuple[Dict, Dict[str, float], List[str], List[str], List[str]]:
         # First, try legacy /recommendations once (some old apps still have access)
         params: Dict[str, str] = {"limit": str(max(1, min(limit, 100)))}  # <=100
         params["market"] = market or self.market
@@ -373,9 +505,9 @@ class SpotifyClient:
                     limit=limit,
                     market=market,
                 )
-                return manual, applied_features, final_genres
+                return manual, applied_features, final_genres, final_artists, final_tracks
             r.raise_for_status()
-            return r.json(), applied_features, final_genres
+            return r.json(), applied_features, final_genres, final_artists, final_tracks
         except requests.RequestException:
             manual = self._manual_recommendations(
                 seed_genres=final_genres or seed_genres,
@@ -384,4 +516,63 @@ class SpotifyClient:
                 limit=limit,
                 market=market,
             )
-            return manual, applied_features, final_genres
+            return manual, applied_features, final_genres, final_artists, final_tracks
+
+    # ---------- Audio features ----------
+
+    def get_audio_features(self, track_ids: List[str]) -> Dict[str, Dict[str, float]]:
+        if not track_ids:
+            return {}
+
+        features_map: Dict[str, Dict[str, float]] = {}
+        chunk_size = 100
+        for start in range(0, len(track_ids), chunk_size):
+            chunk = track_ids[start : start + chunk_size]
+            if not chunk:
+                continue
+            params = {"ids": ",".join(chunk)}
+            try:
+                response = self._session.get(
+                    f"{self.API_BASE_URL}/audio-features",
+                    headers=self._auth_header(),
+                    params=params,
+                    timeout=10,
+                )
+                if response.status_code == 401:
+                    self._refresh_access_token()
+                    response = self._session.get(
+                        f"{self.API_BASE_URL}/audio-features",
+                        headers=self._auth_header(),
+                        params=params,
+                        timeout=10,
+                    )
+                if not response.ok:
+                    continue
+                payload = response.json() or {}
+                for feature_payload in payload.get("audio_features", []) or []:
+                    track_id = feature_payload.get("id")
+                    if not track_id:
+                        continue
+                    normalized = {
+                        key: feature_payload.get(key)
+                        for key in (
+                            "acousticness",
+                            "danceability",
+                            "energy",
+                            "instrumentalness",
+                            "liveness",
+                            "speechiness",
+                            "valence",
+                            "tempo",
+                            "loudness",
+                        )
+                    }
+                    features_map[track_id] = {
+                        name: float(value)
+                        for name, value in normalized.items()
+                        if isinstance(value, (int, float))
+                    }
+            except requests.RequestException:
+                continue
+
+        return features_map
