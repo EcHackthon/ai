@@ -123,7 +123,15 @@ class SpotifyClient:
             self._token_source = "user"
 
         self._cached_genre_seeds: Set[str] = set()
-        self._default_seed_genres: Set[str] = set(self.DEFAULT_SEED_GENRES)
+        provided_default_genres = [
+            g.strip().lower()
+            for g in (default_seed_genres or tuple())
+            if isinstance(g, str) and g.strip()
+        ]
+        if provided_default_genres:
+            self._default_seed_genres: Set[str] = set(provided_default_genres)
+        else:
+            self._default_seed_genres = set(self.DEFAULT_SEED_GENRES)
 
         self._obtain_access_token()
 
