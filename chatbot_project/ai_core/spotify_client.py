@@ -5,9 +5,18 @@ from __future__ import annotations
 import os
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
+
+
+@dataclass
+class ArtistLite:
+    id: str
+    name: str
+    popularity: int
+    followers: int
 
 
 class SpotifyAuthError(Exception):
@@ -641,3 +650,49 @@ class SpotifyClient:
                 continue
 
         return features_map
+
+
+    # ---------- Simple search helpers (raw JSON) ----------
+    def search_tracks_raw(self, q: str, *, limit: int = 20, market: Optional[str] = None) -> List[Dict[str, Any]]:
+        market = market or self.market
+        params = {"q": q, "type": "track", "limit": min(limit, 50), "market": market}
+        try:
+            r = self._session.get(f"{self.API_BASE_URL}/search", headers=self._auth_header(), params=params, timeout=10)
+            if r.status_code == 401:
+                self._refresh_access_token()
+                r = self._session.get(f"{self.API_BASE_URL}/search", headers=self._auth_header(), params=params, timeout=10)
+            if r.ok:
+                return (r.json().get("tracks") or {}).get("items") or []
+        except requests.RequestException:
+            pass
+        return []
+
+    def search_tracks_by_label(self, label: str, *, limit: int = 20, market: Optional[str] = None) -> List[Dict[str, Any]]:
+        q = f'label:\"{label}\"'
+        return self.search_tracks_raw(q, limit=limit, market=market)
+
+
+
+    def search_artists_by_genre(self, genre: str, *, limit: int = 20, market: Optional[str] = None) -> List[ArtistLite]:
+        """Search artists by Spotify genre tag using artist search with genre qualifier."""
+        market = market or self.market
+        q = f'genre:"{genre}"'
+        params = {"q": q, "type": "artist", "limit": min(limit, 50), "market": market}
+        out: List[ArtistLite] = []
+        try:
+            r = self._session.get(f"{self.API_BASE_URL}/search", headers=self._auth_header(), params=params, timeout=10)
+            if r.status_code == 401:
+                self._refresh_access_token()
+                r = self._session.get(f"{self.API_BASE_URL}/search", headers=self._auth_header(), params=params, timeout=10)
+            if r.ok:
+                for a in (r.json().get("artists") or {}).get("items") or []:
+                    out.append(ArtistLite(
+                        id=a.get("id"),
+                        name=a.get("name"),
+                        popularity=int(a.get("popularity") or 0),
+                        followers=int((a.get("followers") or {}).get("total") or 0),
+                    ))
+        except requests.RequestException:
+            pass
+        out.sort(key=lambda A: (A.followers, A.popularity), reverse=True)
+        return out[:limit]

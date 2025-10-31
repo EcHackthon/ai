@@ -6,11 +6,108 @@ from statistics import mean
 from typing import Dict, List, Optional
 
 from .models import RecommendationResult, Track, track_to_payload
-from .spotify_client import SpotifyClient
+from .spotify_client import ArtistLite, SpotifyClient
 
 
 class RecommendationService:
-    """Gemini 분석 결과를 받아 Spotify 추천으로 변환하면 됨."""
+    # _fix61_helpers
+    def _contains_hangul(self, text: str) -> bool:
+        if not text:
+            return False
+        return bool(__import__("re").search(r"[\uac00-\ud7af]", text))
+
+    def _korean_like(self, track: dict, genres: List[str], market: str) -> bool:
+        genre_blob = ",".join([s.lower() for s in genres or []])
+        if "k-" in genre_blob or "korean" in genre_blob or market.upper() == "KR":
+            name = track.get("name") or ""
+            artists = [(artist.get("name") or "") for artist in (track.get("artists") or [])]
+            if any(self._contains_hangul(text) for text in [name] + artists):
+                return True
+            # If no Hangul characters, still allow; we just prefer Hangul if available.
+        return True
+
+    def _norm_pair(self, name: str, artist: str) -> str:
+        import re
+
+        track_name = re.sub(r"\s+", " ", (name or "").lower()).strip()
+        artist_name = re.sub(r"\s+", " ", (artist or "").lower()).strip()
+        return f"{track_name}::{artist_name}"
+
+    def _feature_distance(self, feats: dict, target: dict) -> float:
+        if not feats or not target:
+            return 1e9
+        keys = ["acousticness", "danceability", "energy", "instrumentalness", "valence"]
+        total = 0.0
+        count = 0
+        for key in keys:
+            if key in feats and key in target:
+                delta = float(feats[key]) - float(target[key])
+                total += delta * delta
+                count += 1
+        if "tempo" in feats and "tempo" in target:
+            delta = (float(feats["tempo"]) - float(target["tempo"])) / 50.0
+            total += delta * delta
+            count += 1
+        if "loudness" in feats and "loudness" in target:
+            delta = (float(feats["loudness"]) - float(target["loudness"])) / 10.0
+            total += delta * delta
+            count += 1
+        if count == 0:
+            return 1e9
+        return (total / count) ** 0.5
+
+    # ---- fix6 era-aware helpers ----
+    def _extract_release_year(self, item: dict) -> int:
+        try:
+            date = (item.get("album") or {}).get("release_date") or ""
+            return int(str(date).split("-")[0]) if date else 0
+        except Exception:
+            return 0
+
+    def _is_remaster_like(self, item: dict) -> bool:
+        title = (item.get("name") or "").lower()
+        album = ((item.get("album") or {}).get("name") or "").lower()
+        keywords = [
+            "remaster",
+            "remastered",
+            "re-recorded",
+            "compilation",
+            "greatest hits",
+            "new stereo",
+        ]
+        return any(keyword in title for keyword in keywords) or any(keyword in album for keyword in keywords)
+
+    def _era_from_context(self, genres: List[str], seed_artists: List[str]) -> tuple[int, int]:
+        genre_blob = ",".join([s.lower() for s in genres or []])
+        artist_blob = ",".join([s.lower() for s in seed_artists or []])
+        # Heuristic: classic/vintage french house
+        if (
+            "classic french house" in genre_blob
+            or "french touch" in genre_blob
+            or any(name in artist_blob for name in ["daft punk", "modjo", "stardust", "cassius", "etienne de crecy"])
+        ):
+            return (1996, 2003)
+        # default: no strict era
+        return (0, 0)
+
+    def _score_item(self, item: dict, *, era: tuple[int, int]) -> float:
+        popularity = float(item.get("popularity") or 0) / 100.0
+        start_year, end_year = era
+        year = self._extract_release_year(item)
+        era_bonus = 0.0
+        if start_year and year:
+            if start_year <= year <= end_year:
+                # Gaussian-ish bonus centered in era
+                center = (start_year + end_year) / 2.0
+                width = max(1.0, (end_year - start_year) / 2.0)
+                era_bonus = __import__("math").exp(-((year - center) ** 2) / (2.0 * width * width)) * 0.6
+            else:
+                # small penalty if far from era when era specified
+                era_bonus = -0.2
+        remaster_penalty = -0.25 if self._is_remaster_like(item) else 0.0
+        return popularity + era_bonus + remaster_penalty
+
+    """Convert Gemini analysis into Spotify recommendation results."""
 
     def __init__(
         self,
@@ -23,6 +120,17 @@ class RecommendationService:
         self._default_limit = default_limit
         self._market = market
 
+    def _sanitize_raw_response(self, raw: dict) -> dict:
+        raw = dict(raw or {})
+        if not isinstance(raw.get("per_track_jitter_hint"), dict):
+            raw["per_track_jitter_hint"] = {}
+        genres = raw.get("inferred_genres") or []
+        if isinstance(genres, list):
+            raw["inferred_genres"] = sorted({(g or "").strip().lower() for g in genres if g})
+        else:
+            raw["inferred_genres"] = []
+        return raw
+
     def recommend(
         self,
         *,
@@ -34,13 +142,13 @@ class RecommendationService:
     ) -> RecommendationResult:
         """Request Spotify recommendations based on the analysed profile."""
 
-        # Allow legacy callers that still pass `profile` instead of `target_features`
         if target_features is None and profile is not None:
             target_features = profile
         if not isinstance(target_features, dict):
             raise ValueError("target_features must be provided as a dict")
 
         limit = limit or self._default_limit
+        requested_target_features = dict(target_features)
 
         inferred_genres: List[str] = []
         seen_genres = set()
@@ -63,6 +171,31 @@ class RecommendationService:
             for name in (seed_artists or [])
             if isinstance(name, str) and str(name).strip()
         ]
+
+        ## fix61_anchor_start: build anchor seeds when user didn't name artists
+        if not seed_artist_names and normalized_seed_genres:
+            anchors: List[ArtistLite] = []
+            for genre in normalized_seed_genres[:3]:
+                try:
+                    anchors += self._spotify_client.search_artists_by_genre(genre, limit=10, market=self._market)
+                except Exception:
+                    continue
+            seen_ids: set[str] = set()
+            unique_anchors: List[ArtistLite] = []
+            for artist in anchors:
+                artist_id = getattr(artist, "id", None)
+                if artist_id and artist_id not in seen_ids:
+                    seen_ids.add(artist_id)
+                    unique_anchors.append(artist)
+            unique_anchors = sorted(
+                unique_anchors,
+                key=lambda artist: (getattr(artist, "followers", 0), getattr(artist, "popularity", 0)),
+                reverse=True,
+            )[:5]
+            if unique_anchors:
+                seed_artist_names = [artist.name for artist in unique_anchors]
+        ## fix61_anchor_end
+
         resolved_artist_ids = (
             self._spotify_client.resolve_artist_ids(seed_artist_names, market=self._market)
             if seed_artist_names
@@ -77,44 +210,154 @@ class RecommendationService:
             limit=limit,
             market=self._market,
         )
+        raw_response = self._sanitize_raw_response(raw_response)
+        response_target_features = dict(raw_response.get("target_features") or requested_target_features)
+        jitter_hint = raw_response.get("per_track_jitter_hint")
         if not used_genres:
             used_genres = normalized_seed_genres.copy()
 
-        original_tracks = raw_response.get("tracks", [])
+        original_tracks = raw_response.get("tracks", []) or []
         raw_tracks = [
             item for item in original_tracks
             if item.get("popularity", 0) >= 40
         ]
+        search_terms = self._collect_search_terms(normalized_seed_genres, inferred_genres)
         if not raw_tracks:
-            raw_tracks = original_tracks
+            ## fix6_fallback_search_start: label & text search
+            label_hints = list((raw_response.get("label_hints") or []))
+            pool: List[dict] = []
+            try:
+                for label in label_hints[:4]:
+                    pool += self._spotify_client.search_tracks_by_label(label, limit=25)
+            except Exception:
+                pass
+            if not pool:
+                for genre in normalized_seed_genres[:3]:
+                    try:
+                        pool += self._spotify_client.search_tracks_raw(genre, limit=20)
+                    except Exception:
+                        continue
+            era_window = self._era_from_context(inferred_genres, seed_artist_names)
+            pool = [item for item in pool if item.get("id")]
+            if pool:
+                scored_pool = [(self._score_item(item, era=era_window), item) for item in pool]
+                scored_pool.sort(key=lambda pair: pair[0], reverse=True)
+                raw_tracks = [item for _, item in scored_pool[:limit]]
+            ## fix6_fallback_search_end
+            if not raw_tracks:
+                raw_tracks = self._augment_from_search_terms(
+                    terms=search_terms,
+                    existing=raw_tracks,
+                    limit=limit,
+                    market=self._market,
+                ) or original_tracks
 
-        # Prefer artist diversity (avoid many tracks from the same artist)
         seen_artists = set()
-        diverse_tracks = []
-        for it in raw_tracks:
-            artist_names = tuple(artist.get("name") for artist in it.get("artists", []) if artist.get("name"))
+        diverse_tracks: List[dict] = []
+        for item in raw_tracks:
+            artist_names = tuple(
+                artist.get("name")
+                for artist in item.get("artists", [])
+                if artist.get("name")
+            )
             key = artist_names[0] if artist_names else None
             if key is None or key not in seen_artists:
                 if key:
                     seen_artists.add(key)
-                diverse_tracks.append(it)
+                diverse_tracks.append(item)
         raw_tracks = diverse_tracks or raw_tracks
+
+        ## fix6_rerank_start: era-aware re-ranking
+        era_window = self._era_from_context(inferred_genres, seed_artist_names)
+        if raw_tracks:
+            scored_tracks = [(self._score_item(item, era=era_window), item) for item in raw_tracks]
+            scored_tracks.sort(key=lambda pair: pair[0], reverse=True)
+            raw_tracks = [item for _, item in scored_tracks]
+        ## fix6_rerank_end
+
+        ## fix61_vibe_postproc_start: market/language filter, popularity floor, dedup, distance rank
+        market_val = self._market or getattr(self._spotify_client, "market", None) or "KR"
+
+        def apply_filters(pool: List[dict], pop_floor: int, market_code: str) -> List[dict]:
+            seen_ids: set[str] = set()
+            seen_pairs: set[str] = set()
+            filtered: List[dict] = []
+            for track in pool:
+                track_id = track.get("id")
+                popularity = int(track.get("popularity") or 0)
+                if popularity < pop_floor:
+                    continue
+                if not self._korean_like(track, inferred_genres, market_code):
+                    continue
+                if track_id and track_id in seen_ids:
+                    continue
+                artist_name = ((track.get("artists") or [{}])[0].get("name") or "")
+                pair_key = self._norm_pair(track.get("name"), artist_name)
+                if pair_key in seen_pairs:
+                    continue
+                seen_ids.add(track_id)
+                seen_pairs.add(pair_key)
+                filtered.append(track)
+            return filtered
+
+        stage: List[dict] = []
+        feat_map: Dict[str, Dict[str, float]] = {}
+        if raw_tracks:
+            stage = apply_filters(raw_tracks, 55, market_val)
+            if len(stage) < limit:
+                stage = apply_filters(raw_tracks, 50, market_val)
+            if len(stage) < limit:
+                stage = apply_filters(raw_tracks, 45, market_val)
+        if stage:
+            feats_list = self._spotify_client.get_audio_features([track["id"] for track in stage])
+            for features in feats_list or []:
+                if features and features.get("id"):
+                    feat_map[features["id"]] = features
+            scored_stage = []
+            for track in stage:
+                features = feat_map.get(track.get("id")) or {}
+                distance = self._feature_distance(features, response_target_features)
+                popularity_bonus = float(track.get("popularity") or 0) / 200.0
+                scored_stage.append((-distance + popularity_bonus, track))
+            scored_stage.sort(key=lambda pair: pair[0], reverse=True)
+            raw_tracks = [track for _, track in scored_stage[:limit]]
+        ## fix61_vibe_postproc_end
+        if len(raw_tracks) < limit:
+            supplements = self._augment_from_search_terms(
+                terms=search_terms,
+                existing=raw_tracks,
+                market=self._market,
+                limit=limit - len(raw_tracks),
+            )
+            if supplements:
+                raw_tracks.extend(supplements)
+                raw_tracks = apply_filters(raw_tracks, 40, market_val)
+                if len(raw_tracks) < limit:
+                    refill = self._augment_from_search_terms(
+                        terms=search_terms,
+                        existing=raw_tracks,
+                        market=self._market,
+                        limit=limit - len(raw_tracks),
+                    )
+                    if refill:
+                        raw_tracks.extend(refill)
+                        raw_tracks = apply_filters(raw_tracks, 40, market_val)
 
         matched_seed_artists: List[str] = []
         if seed_artist_names:
             seed_lookup = {name.lower(): name for name in seed_artist_names}
-            filtered: List[dict] = []
-            for it in raw_tracks:
-                artist_names = [a.get("name", "") for a in it.get("artists", [])]
+            filtered_tracks: List[dict] = []
+            for item in raw_tracks:
+                artist_names = [artist.get("name", "") for artist in item.get("artists", [])]
                 lower_names = [name.lower() for name in artist_names if name]
                 overlap = [seed_lookup[name] for name in lower_names if name in seed_lookup]
                 if overlap:
-                    filtered.append(it)
+                    filtered_tracks.append(item)
                     for name in overlap:
                         if name not in matched_seed_artists:
                             matched_seed_artists.append(name)
-            if filtered:
-                raw_tracks = filtered
+            if filtered_tracks:
+                raw_tracks = filtered_tracks
             if seed_artist_ids and len(raw_tracks) < limit:
                 fallback_tracks = self._spotify_client.get_artist_top_tracks(
                     seed_artist_ids,
@@ -124,14 +367,14 @@ class RecommendationService:
                 extra: List[dict] = []
                 seen_ids = {item.get("id") for item in raw_tracks if item.get("id")}
                 for track in fallback_tracks:
-                    tid = track.get("id")
-                    if not tid or tid in seen_ids:
+                    track_id = track.get("id")
+                    if not track_id or track_id in seen_ids:
                         continue
-                    seen_ids.add(tid)
+                    seen_ids.add(track_id)
                     extra.append(track)
                     if len(raw_tracks) + len(extra) >= limit:
                         break
-                    artist_names = [a.get("name", "") for a in track.get("artists", [])]
+                    artist_names = [artist.get("name", "") for artist in track.get("artists", [])]
                     for name in artist_names:
                         canonical = seed_lookup.get(name.lower())
                         if canonical and canonical not in matched_seed_artists:
@@ -147,14 +390,30 @@ class RecommendationService:
                 if fallback_tracks:
                     raw_tracks = fallback_tracks
                     matched_seed_artists = seed_artist_names.copy()
+            if len(raw_tracks) < limit:
+                artist_supplements = self._augment_from_artist_search(
+                    seed_artist_names,
+                    existing=raw_tracks,
+                    market=self._market,
+                    take=limit - len(raw_tracks),
+                )
+                if artist_supplements:
+                    raw_tracks.extend(artist_supplements)
 
         audio_features_map: Dict[str, Dict[str, float]] = {}
         track_ids = [item.get("id") for item in raw_tracks if item.get("id")]
         if track_ids:
             audio_features_map = self._spotify_client.get_audio_features(track_ids)
+        ranked_tracks = self._rank_tracks(
+            raw_tracks,
+            audio_features_map,
+            response_target_features,
+            jitter_hint=jitter_hint,
+            limit=limit,
+        )
 
         tracks: List[Track] = []
-        for item in raw_tracks:
+        for item in ranked_tracks:
             track_id = item.get("id")
             if not track_id:
                 continue
@@ -165,7 +424,11 @@ class RecommendationService:
                 Track(
                     id=track_id,
                     name=item.get("name", ""),
-                    artists=[artist.get("name", "") for artist in item.get("artists", []) if artist.get("name")],
+                    artists=[
+                        artist.get("name", "")
+                        for artist in item.get("artists", [])
+                        if artist.get("name")
+                    ],
                     external_url=item.get("external_urls", {}).get("spotify", ""),
                     album_image=album_images[0]["url"] if album_images else None,
                     audio_features=features,
@@ -184,6 +447,152 @@ class RecommendationService:
             tracks=tracks,
             raw_response=raw_response,
         )
+
+    def _collect_search_terms(self, normalized: List[str], inferred: List[str]) -> List[str]:
+        terms: List[str] = []
+        seen: set[str] = set()
+        for source in (normalized or []):
+            lower = source.lower().strip()
+            if lower and lower not in seen:
+                terms.append(lower)
+                seen.add(lower)
+        if not terms:
+            for genre in inferred or []:
+                if not isinstance(genre, str):
+                    continue
+                lower = genre.lower().strip()
+                if lower and lower not in seen:
+                    terms.append(lower)
+                    seen.add(lower)
+        if not terms:
+            return []
+        return terms[:6]
+
+    def _augment_from_search_terms(
+        self,
+        *,
+        terms: List[str],
+        existing: List[dict],
+        market: Optional[str],
+        limit: int,
+    ) -> List[dict]:
+        if limit <= 0 or not terms:
+            return []
+        existing_ids = {item.get("id") for item in existing if item.get("id")}
+        seen_pairs = {
+            self._norm_pair(item.get("name"), ((item.get("artists") or [{}])[0].get("name") or ""))
+            for item in existing
+        }
+        collected: List[dict] = []
+        for term in terms:
+            try:
+                candidates = self._spotify_client.search_tracks_raw(term, limit=25, market=market)
+            except Exception:
+                continue
+            for track in candidates:
+                track_id = track.get("id")
+                if not track_id or track_id in existing_ids:
+                    continue
+                artist_name = ((track.get("artists") or [{}])[0].get("name") or "")
+                pair = self._norm_pair(track.get("name"), artist_name)
+                if pair in seen_pairs:
+                    continue
+                existing_ids.add(track_id)
+                seen_pairs.add(pair)
+                collected.append(track)
+                if len(collected) >= limit:
+                    return collected
+        return collected
+
+    def _augment_from_artist_search(
+        self,
+        artist_names: List[str],
+        *,
+        existing: List[dict],
+        market: Optional[str],
+        take: int,
+    ) -> List[dict]:
+        if take <= 0 or not artist_names:
+            return []
+        existing_ids = {item.get("id") for item in existing if item.get("id")}
+        seen_pairs = {
+            self._norm_pair(item.get("name"), ((item.get("artists") or [{}])[0].get("name") or ""))
+            for item in existing
+        }
+        supplements: List[dict] = []
+        for artist_name in artist_names:
+            query = f'artist:"{artist_name}"'
+            try:
+                results = self._spotify_client.search_tracks_raw(query, limit=25, market=market)
+            except Exception:
+                continue
+            lower_seed_names = {name.lower() for name in artist_names if isinstance(name, str)}
+            for track in results:
+                track_id = track.get("id")
+                if not track_id or track_id in existing_ids:
+                    continue
+                artist_names_payload = [a.get("name", "") for a in track.get("artists", []) if a.get("name")]
+                lower_payloads = {name.lower() for name in artist_names_payload if isinstance(name, str)}
+                if lower_payloads and not (lower_payloads & lower_seed_names):
+                    continue
+                pair = self._norm_pair(track.get("name"), artist_names_payload[0] if artist_names_payload else "")
+                if pair in seen_pairs:
+                    continue
+                existing_ids.add(track_id)
+                seen_pairs.add(pair)
+                supplements.append(track)
+                if len(supplements) >= take:
+                    return supplements
+        return supplements
+
+    def _rank_tracks(
+        self,
+        tracks: List[dict],
+        audio_features_map: Dict[str, Dict[str, float]],
+        target_features: Dict[str, float],
+        *,
+        jitter_hint: Optional[Dict[str, float]],
+        limit: int,
+    ) -> List[dict]:
+        if not tracks:
+            return []
+        scored: List[tuple[float, dict]] = []
+        for index, track in enumerate(tracks):
+            track_id = track.get("id")
+            features = audio_features_map.get(track_id) or {}
+            distance = self._feature_distance(features, target_features)
+            if not target_features:
+                distance = 1.0
+            popularity_bonus = float(track.get("popularity") or 0) / 200.0
+            jitter_score = self._jitter_score(track_id, target_features, jitter_hint)
+            base = -distance + popularity_bonus + jitter_score
+            # slight bias to original ordering to keep deterministic behaviour
+            stability = -index * 1e-5
+            scored.append((base + stability, track))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [track for _, track in scored[:limit]]
+
+    def _jitter_score(
+        self,
+        track_id: Optional[str],
+        target_features: Dict[str, float],
+        jitter_hint: Optional[Dict[str, float]],
+    ) -> float:
+        if not track_id or not jitter_hint:
+            return 0.0
+        try:
+            import hashlib
+        except ImportError:
+            return 0.0
+        key_parts = [f"{name}:{value:.3f}" for name, value in sorted(target_features.items())]
+        payload = f"{track_id}|{'|'.join(key_parts)}".encode("utf-8", "ignore")
+        digest = hashlib.sha1(payload).digest()
+        magnitude = sum(float(v) for v in jitter_hint.values() if isinstance(v, (int, float)))
+        if magnitude == 0.0:
+            return 0.0
+        # Map digest to [-0.5, 0.5] and scale by jitter magnitude (keeping it tiny)
+        span = int.from_bytes(digest[:8], "big") / (2**64 - 1) - 0.5
+        return span * (magnitude / len(jitter_hint)) * 0.05
 
     @staticmethod
     def build_backend_payload(result: RecommendationResult) -> Dict:
@@ -254,7 +663,7 @@ class RecommendationService:
             descriptors.append("instrumental focus")
 
         genre_candidates = [
-            g.strip() for g in genres or [] if isinstance(g, str) and g.strip()
+            genre.strip() for genre in genres or [] if isinstance(genre, str) and genre.strip()
         ]
         genre_phrase = None
         if genre_candidates:
@@ -276,4 +685,3 @@ class RecommendationService:
             return None
 
         return " | ".join(components) + "."
-

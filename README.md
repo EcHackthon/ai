@@ -137,3 +137,29 @@ Spotify 권장 사양에 맞춰 오디오 피처 값은 자동으로
 python -m compileall chatbot_project
 ```
 
+
+
+## Policy fix6.2 changes
+- Mood-only flow now builds **anchor artists** from inferred genres (market-aware) and uses them as seeds.
+- Added KR-language preference (non-strict), popularity floors (55→50→45), de-dup by (title, main-artist).
+- Re-ranking by distance to `target_features` using `audio-features` + small popularity bonus.
+- Sanitizes malformed Gemini JSON (e.g., duplicated `per_track_jitter_hint`).
+
+### env (.env)
+```
+GEMINI_API_KEY=
+SPOTIFY_CLIENT_ID=
+SPOTIFY_CLIENT_SECRET=
+SPOTIFY_REFRESH_TOKEN=
+SPOTIFY_REDIRECT_URI=http://127.0.0.1:5470
+SPOTIFY_MARKET=KR
+GEMINI_MODEL=gemini-2.5-flash
+```
+
+### Known Spotify constraints
+- `recommendations` API: **genre seeds** are limited to Spotify's `available-genre-seeds` 목록으로만 동작합니다. 모델이 추정한 장르는 **앵커 아티스트**를 통해 보완합니다.
+
+### Run
+```
+py main.py
+```
