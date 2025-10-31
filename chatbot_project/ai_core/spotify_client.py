@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
 import time
-from typing import Dict, List, Optional, Tuple, Set, Any
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 
@@ -245,6 +246,119 @@ class SpotifyClient:
 
         self._cached_genre_seeds = genres
         return genres
+
+    @staticmethod
+    def _genre_name_variants(name: str) -> List[str]:
+        base = (name or "").strip().lower()
+        if not base:
+            return []
+        cleaned = re.sub(r"[^a-z0-9\\s-]", " ", base)
+        cleaned = re.sub(r"\\s+", " ", cleaned).strip()
+        candidates = []
+        for candidate in (
+            base,
+            cleaned,
+            cleaned.replace(" ", "-"),
+            cleaned.replace(" ", ""),
+            base.replace(" ", "-"),
+        ):
+            candidate = candidate.strip()
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        return candidates
+
+    def normalize_genres(self, genres: Iterable[str]) -> List[str]:
+        """
+        Map free-form genre strings to Spotify's allowed genre seeds.
+        """
+        avail = self._get_available_genre_seeds()
+        normalized: List[str] = []
+        for name in genres or []:
+            if not isinstance(name, str):
+                continue
+            for candidate in self._genre_name_variants(name):
+                if candidate in avail:
+                    normalized.append(candidate)
+                    break
+            if len(normalized) >= 5:
+                break
+        return normalized[:5]
+
+    def resolve_artist_ids(self, names: Iterable[str], *, market: Optional[str] = None) -> Dict[str, str]:
+        """
+        Resolve human-readable artist names to Spotify artist IDs.
+        """
+        resolved: Dict[str, str] = {}
+        for original in names or []:
+            if not isinstance(original, str):
+                continue
+            query = original.strip()
+            if not query:
+                continue
+            params = {"q": query, "type": "artist", "limit": 5}
+            if market:
+                params["market"] = market
+            try:
+                r = self._session.get(
+                    f"{self.API_BASE_URL}/search",
+                    headers=self._auth_header(),
+                    params=params,
+                    timeout=10,
+                )
+                if r.status_code == 401:
+                    self._refresh_access_token()
+                    r = self._session.get(
+                        f"{self.API_BASE_URL}/search",
+                        headers=self._auth_header(),
+                        params=params,
+                        timeout=10,
+                    )
+                if not r.ok:
+                    continue
+                items = (r.json().get("artists") or {}).get("items") or []
+                query_norm = query.lower()
+                candidate_id: Optional[str] = None
+                for item in items:
+                    aid = item.get("id")
+                    name = (item.get("name") or "").lower()
+                    if not aid or not name:
+                        continue
+                    candidate_id = aid
+                    if name == query_norm:
+                        candidate_id = aid
+                        break
+                if candidate_id:
+                    resolved[original] = candidate_id
+            except requests.RequestException:
+                continue
+        return resolved
+
+    def get_artist_top_tracks(
+        self,
+        artist_ids: Iterable[str],
+        *,
+        market: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[dict]:
+        """
+        Fetch top tracks for the provided artist IDs.
+        """
+        collected: List[dict] = []
+        seen: Set[str] = set()
+        for aid in artist_ids or []:
+            if len(collected) >= limit:
+                break
+            if not isinstance(aid, str) or not aid:
+                continue
+            for track in self._artist_top_tracks(aid, market=market):
+                tid = track.get("id")
+                if not tid or tid in seen:
+                    continue
+                seen.add(tid)
+                collected.append(track)
+                if len(collected) >= limit:
+                    break
+        return collected[:limit]
 
     def _select_seed_genres(self, seed_genres: Optional[List[str]]) -> List[str]:
         if not seed_genres:

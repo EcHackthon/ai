@@ -16,6 +16,7 @@ class Track:
     external_url: str
     album_image: Optional[str]
     audio_features: Optional[Dict[str, float]] = None
+    summary: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class RecommendationResult:
     features: Dict[str, float]
     seed_genres: List[str]
     inferred_genres: List[str]
+    seed_artists: List[str] = field(default_factory=list)
     tracks: List[Track] = field(default_factory=list)
     raw_response: Dict[str, Any] = field(default_factory=dict)
 
@@ -44,6 +46,8 @@ def track_to_payload(track: Track) -> Dict[str, Any]:
     }
     if track.audio_features is not None:
         payload["audio_features"] = track.audio_features
+    if track.summary:
+        payload["summary"] = track.summary
 
     return payload
 

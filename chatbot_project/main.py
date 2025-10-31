@@ -8,7 +8,7 @@ import json
 from typing import Optional
 
 from ai_core.config import Settings
-from ai_core.gemini_chat import GeminiMusicChat
+from ai_core.strict_chat import StrictGeminiMusicChat as GeminiMusicChat
 from ai_core.recommendation_service import RecommendationService
 from ai_core.spotify_client import SpotifyClient, SpotifyAuthError
 
@@ -16,9 +16,18 @@ from ai_core.spotify_client import SpotifyClient, SpotifyAuthError
 def _print_recommendations(payload: dict) -> None:
     print("\n🎧 Spotify 추천 플레이리스트")
     print("-" * 40)
+    seed_artists = payload.get("seed_artists") or []
+    seed_genres = payload.get("seed_genres") or []
+    if seed_artists:
+        print(f"선호 아티스트 기준: {', '.join(seed_artists)}")
+    elif seed_genres:
+        print(f"참고 장르: {', '.join(seed_genres)}")
     for idx, track in enumerate(payload.get("tracks", []), start=1):
         artists = ", ".join(track["artists"])
         print(f"{idx}. {track['name']} - {artists}")
+        summary = track.get("summary")
+        if summary:
+            print(f"   🎧 {summary}")
         if track.get("url"):
             print(f"   🔗 {track['url']}")
         features = track.get("audio_features")
@@ -74,6 +83,7 @@ def run_cli(limit: Optional[int] = None) -> None:
             recommendation_result = recommendation_service.recommend(
                 target_features=gemini_response.target_features,
                 genres=gemini_response.genres,
+                seed_artists=getattr(gemini_response, 'seed_artists', None),
             )
         except SpotifyAuthError as exc:
             print(f"❌ Spotify 인증 오류: {exc}")
@@ -114,4 +124,3 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     run_cli(limit=args.limit)
-
