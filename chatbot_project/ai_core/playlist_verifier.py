@@ -70,13 +70,13 @@ class GeminiPlaylistVerifier:
         genai.configure(api_key=api_key)
         self._model = genai.GenerativeModel(
             model_name,
-            system_instruction=_VERIFIER_SYSTEM_PROMPT,
             generation_config={
                 "temperature": 0.45,
                 "top_p": 0.9,
                 "max_output_tokens": 1024,
             },
         )
+        self._system_prompt = _VERIFIER_SYSTEM_PROMPT
         self._max_candidates = max(5, max_candidates)
 
     def select_tracks(
@@ -111,7 +111,8 @@ class GeminiPlaylistVerifier:
         )
 
         try:
-            response = self._model.generate_content(user_prompt)
+            prompt = f"{self._system_prompt}\n\n{user_prompt}"
+            response = self._model.generate_content(prompt)
         except Exception as error:  # pragma: no cover - 네트워크 오류 대비
             logger.warning("Gemini playlist verifier call failed: %s", error)
             return PlaylistVerifierResult(track_ids=[])
