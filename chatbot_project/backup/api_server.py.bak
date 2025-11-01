@@ -1,0 +1,161 @@
+"""Flask API 서버: 프론트엔드와 Gemini AI를 연결합니다."""
+
+from __future__ import annotations
+
+import logging
+from typing import Dict, Any
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
+from ai_core.config import Settings
+from ai_core.strict_chat import StrictGeminiMusicChat as GeminiMusicChat
+from ai_core.recommendation_service import RecommendationService
+from ai_core.spotify_client import SpotifyClient, SpotifyAuthError
+
+
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+CORS(app)  # 모든 origin 허용 (개발 환경)
+
+# 전역 설정 및 인스턴스
+settings = Settings.from_env()
+chat = GeminiMusicChat(api_key=settings.gemini_api_key, model_name=settings.gemini_model)
+spotify_client = SpotifyClient(settings)
+recommendation_service = RecommendationService(
+    spotify_client,
+    default_limit=5,
+    market=settings.spotify_market,
+)
+
+# 세션별 채팅 인스턴스를 관리하기 위한 딕셔너리 (간단한 구현)
+# 실제 프로덕션에서는 Redis 등을 사용하는 것이 좋습니다
+chat_sessions: Dict[str, GeminiMusicChat] = {}
+
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """서버 상태 확인"""
+    return jsonify({"status": "ok", "message": "AI server is running"})
+
+
+@app.route('/api/chat', methods=['POST'])
+def chat_endpoint():
+    """
+    프론트엔드에서 사용자 메시지를 받아 Gemini에 전달하고 응답을 반환합니다.
+    
+    Request Body:
+    {
+        "message": "사용자 메시지",
+        "session_id": "세션 ID (선택사항)"
+    }
+    
+    Response:
+    {
+        "type": "conversation" | "analysis_complete" | "error",
+        "message": "AI 응답 메시지",
+        "recommendations": [...] (분석 완료 시에만 포함)
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data or 'message' not in data:
+            return jsonify({
+                "type": "error",
+                "message": "메시지가 필요합니다."
+            }), 400
+        
+        user_message = data['message']
+        session_id = data.get('session_id', 'default')
+        
+        # 세션별 채팅 인스턴스 가져오기 (없으면 전역 인스턴스 사용)
+        current_chat = chat_sessions.get(session_id, chat)
+        
+        logger.info(f"[Session: {session_id}] User message: {user_message}")
+        
+        # Gemini에 메시지 전송
+        gemini_response = current_chat.send_message(user_message)
+        
+        response_data = {
+            "type": gemini_response.type,
+            "message": gemini_response.message,
+        }
+        
+        # 분석이 완료된 경우 Spotify 추천 생성
+        if gemini_response.type == "analysis_complete" and gemini_response.target_features:
+            try:
+                recommendation_result = recommendation_service.recommend(
+                    target_features=gemini_response.target_features,
+                    genres=gemini_response.genres,
+                    seed_artists=None,
+                )
+                
+                payload = recommendation_service.build_backend_payload(recommendation_result)
+                response_data["recommendations"] = payload
+                
+                logger.info(f"[Session: {session_id}] Generated {len(payload.get('tracks', []))} recommendations")
+                
+            except SpotifyAuthError as exc:
+                logger.error(f"Spotify auth error: {exc}")
+                response_data["message"] += "\n\n⚠️ Spotify 인증 오류가 발생했습니다."
+            except Exception as exc:
+                logger.error(f"Recommendation error: {exc}")
+                response_data["message"] += "\n\n⚠️ 추천 생성 중 오류가 발생했습니다."
+        
+        return jsonify(response_data), 200
+        
+    except Exception as e:
+        logger.exception(f"Error in chat endpoint: {e}")
+        return jsonify({
+            "type": "error",
+            "message": "서버 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
+        }), 500
+
+
+@app.route('/api/chat/reset', methods=['POST'])
+def reset_chat():
+    """
+    채팅 세션을 초기화합니다.
+    
+    Request Body:
+    {
+        "session_id": "세션 ID (선택사항)"
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        session_id = data.get('session_id', 'default')
+        
+        if session_id in chat_sessions:
+            chat_sessions[session_id].reset()
+        else:
+            chat.reset()
+        
+        logger.info(f"[Session: {session_id}] Chat reset")
+        
+        return jsonify({
+            "status": "ok",
+            "message": "대화가 초기화되었습니다."
+        }), 200
+        
+    except Exception as e:
+        logger.exception(f"Error in reset endpoint: {e}")
+        return jsonify({
+            "type": "error",
+            "message": "초기화 중 오류가 발생했습니다."
+        }), 500
+
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("🚀 AI API 서버를 시작합니다...")
+    print("📍 서버 주소: http://localhost:5000")
+    print("📍 Health check: http://localhost:5000/api/health")
+    print("📍 Chat endpoint: POST http://localhost:5000/api/chat")
+    print("=" * 60)
+    
+    app.run(host='0.0.0.0', port=5000, debug=True)
