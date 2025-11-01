@@ -46,10 +46,10 @@ SYSTEM_PROMPT = """
 2-3. 자연 탐색(락이 없을 때)
 - artist lock이 없다면, 너무 마이너하지 않은 **다양한 아티스트**가 추천될 수 있도록 합니다(동일 아티스트 편중 금지 힌트 제공).
 
-# 3) 타깃 오디오 특성 (Audio Features)
-- 한 번의 추천에서 5곡을 뽑더라도, **각 곡의 프로파일이 살짝 다르게** 느껴지도록 **기준 프로파일 + 소폭 변형**(± 허용치)을 권장합니다.
-- 단, 시스템의 하위 호환을 위해 **`target_features`는 반드시 1개**를 제공합니다.
-- 추가로, 지원되는 경우를 대비해 `per_track_jitter_hint`를 제공합니다(백엔드가 사용하지 않더라도 JSON 스키마 호환).
+# 3) Ÿ�� ����� Ư�� (Audio Features)
+- �� ���� ��õ���� 5���� �̴���, **�� ���� ���������� ��¦ �ٸ���** ���������� **���� �������� + ���� ����**(�� ���ġ)�� �����մϴ�.
+- �� Ư���� ��ȯ�� ���� **`target_feature_ranges`�� [�ּ�, �ִ�] ����**�� ��Ÿ����, �� �߽��� `target_features`�� ���� ���� �����մϴ�.
+- ������ ������ ������ `per_track_jitter_hint`�� ���Ͽ� ���Ÿ��� ���� �������� JSON ��Ű�� ȣȯ�մϴ�.
 
 기본 범위 가이드(설명용, 출력 시 설명 문구는 넣지 않음):
 - acousticness, danceability, energy, instrumentalness, valence: [0.0, 1.0]
@@ -61,14 +61,23 @@ SYSTEM_PROMPT = """
 ```json
 {
   "ready": true,
+  "target_feature_ranges": {
+    "acousticness": {"min": 0.15, "max": 0.3},
+    "danceability": {"min": 0.35, "max": 0.5},
+    "energy": {"min": 0.6, "max": 0.8},
+    "instrumentalness": {"min": 0.0, "max": 0.1},
+    "valence": {"min": 0.45, "max": 0.6},
+    "tempo": {"min": 110, "max": 130},
+    "loudness": {"min": -8.0, "max": -5.0}
+  },
   "target_features": {
-    "acousticness": 0.0,
-    "danceability": 0.0,
-    "energy": 0.0,
-    "instrumentalness": 0.0,
-    "valence": 0.0,
+    "acousticness": 0.22,
+    "danceability": 0.42,
+    "energy": 0.7,
+    "instrumentalness": 0.05,
+    "valence": 0.52,
     "tempo": 120,
-    "loudness": -7.0
+    "loudness": -6.5
   },
   "inferred_genres": ["optional", "array", "of", "strings"],
   "seed_artists": ["optional-artist-name-if-locked"],
@@ -90,9 +99,10 @@ SYSTEM_PROMPT = """
 ```
 
 - `inferred_genres`: Spotify에서 직접 받지 않고 **유추**하여 입력(없어도 됨).
-- `seed_artists`: 아티스트 고정 시 필수, 그 외에는 생략 또는 빈 배열.
-- `diversity_hint`: 동일 아티스트 편중 방지 및 인기 하한선 제시(백엔드가 참조할 수 있도록 힌트 제공; 미지원이어도 무방).
-- `per_track_jitter_hint`: 동일 분위기 내에서 곡별 미세 차이를 주기 위한 권장치(미지원이어도 무방).
+- `seed_artists`: ��Ƽ��Ʈ ���� �� �ʼ�, �� �ܿ��� ���� �Ǵ� �� �迭.
+- `target_feature_ranges`: ���� ������ ������ ���� ���� �ֱ� ���� **�ּ�/�ִ� ����**.
+- `diversity_hint`: ���� ��Ƽ��Ʈ ���� ���� �� �α� ���Ѽ� ����(�鿣�尡 ������ �� �ֵ��� ��Ʈ ����; �������̾ ����).
+- `per_track_jitter_hint`: ���� ������ ������ � �̼� ���̸� �ֱ� ���� ����ġ(�������̾ ����).
 
 # 5) 진행 중(정보 부족) 응답
 정보가 부족하면 아래처럼 **딱 한 줄**만 JSON으로 출력합니다. 다른 텍스트 금지.

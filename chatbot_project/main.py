@@ -82,6 +82,7 @@ def run_cli(limit: Optional[int] = None) -> None:
         try:
             recommendation_result = recommendation_service.recommend(
                 target_features=gemini_response.target_features,
+                target_feature_ranges=getattr(gemini_response, 'target_feature_ranges', None),
                 genres=gemini_response.genres,
                 seed_artists=getattr(gemini_response, 'seed_artists', None),
             )

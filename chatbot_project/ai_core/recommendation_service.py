@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import random
 from statistics import mean
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .models import RecommendationResult, Track, track_to_payload
 from .spotify_client import ArtistLite, SpotifyClient
@@ -55,6 +56,165 @@ class RecommendationService:
         if count == 0:
             return 1e9
         return (total / count) ** 0.5
+
+    def _normalize_target_features(
+        self,
+        raw_features: Optional[Dict[str, Any]],
+        *,
+        declared_ranges: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
+        centers: Dict[str, float] = {}
+        ranges: Dict[str, Dict[str, float]] = {}
+
+        def _parse_num(value: Any) -> Optional[float]:
+            if isinstance(value, (int, float)):
+                return float(value)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _coerce_range(payload: Any) -> Optional[Dict[str, float]]:
+            lo = hi = target = None
+            if isinstance(payload, dict):
+                lo = _parse_num(payload.get("min"))
+                hi = _parse_num(payload.get("max"))
+                target = _parse_num(
+                    payload.get("target")
+                    or payload.get("value")
+                    or payload.get("center")
+                    or payload.get("mid")
+                    or payload.get("mean")
+                )
+                spread = _parse_num(payload.get("spread") or payload.get("width") or payload.get("delta"))
+                if spread is not None and target is not None:
+                    if lo is None:
+                        lo = target - spread
+                    if hi is None:
+                        hi = target + spread
+                if target is None and lo is not None and hi is not None:
+                    target = (lo + hi) / 2.0
+                if target is None and lo is not None and hi is None:
+                    hi = lo
+                    target = lo
+                if target is None and hi is not None and lo is None:
+                    lo = hi
+                    target = hi
+            elif isinstance(payload, (list, tuple)) and len(payload) >= 2:
+                lo = _parse_num(payload[0])
+                hi = _parse_num(payload[1])
+                target = _parse_num(payload[2]) if len(payload) >= 3 else None
+                if target is None and lo is not None and hi is not None:
+                    target = (lo + hi) / 2.0
+            else:
+                return None
+            if lo is None and hi is None and target is not None:
+                lo = hi = target
+            if lo is None:
+                lo = hi
+            if hi is None:
+                hi = lo
+            if lo is None or hi is None:
+                return None
+            lo_f = float(lo)
+            hi_f = float(hi)
+            if hi_f < lo_f:
+                lo_f, hi_f = hi_f, lo_f
+            target_val = float(target) if target is not None else (lo_f + hi_f) / 2.0
+            return {"min": lo_f, "max": hi_f, "target": target_val}
+
+        if isinstance(declared_ranges, dict):
+            for name, payload in declared_ranges.items():
+                if not isinstance(name, str):
+                    continue
+                coerced = _coerce_range(payload)
+                if coerced is None:
+                    continue
+                ranges[name] = coerced
+                centers.setdefault(name, coerced["target"])
+
+        if isinstance(raw_features, dict):
+            for name, value in raw_features.items():
+                if not isinstance(name, str):
+                    continue
+                coerced = None
+                if isinstance(value, (dict, list, tuple)):
+                    coerced = _coerce_range(value)
+                if coerced is not None:
+                    ranges[name] = coerced
+                    centers[name] = coerced["target"]
+                    continue
+                num = _parse_num(value)
+                if num is None:
+                    continue
+                centers[name] = num
+                entry = ranges.get(name)
+                if entry is None:
+                    ranges[name] = {"min": num, "max": num, "target": num}
+                else:
+                    entry["target"] = num
+                    entry["min"] = min(entry.get("min", num), num)
+                    entry["max"] = max(entry.get("max", num), num)
+
+        for name, value in list(centers.items()):
+            entry = ranges.setdefault(name, {"min": value, "max": value, "target": value})
+            entry["target"] = float(entry.get("target", value))
+            entry["min"] = min(float(entry.get("min", value)), value)
+            entry["max"] = max(float(entry.get("max", value)), value)
+
+        for name, info in list(ranges.items()):
+            if name not in centers:
+                target = info.get("target")
+                if isinstance(target, (int, float)):
+                    centers[name] = float(target)
+
+        return centers, ranges
+
+    def _sample_target_features(
+        self,
+        centers: Dict[str, float],
+        ranges: Dict[str, Dict[str, float]],
+    ) -> Dict[str, float]:
+        if not centers and not ranges:
+            return {}
+        sampled: Dict[str, float] = {}
+        for name, center in centers.items():
+            info = ranges.get(name) or {}
+            lo = info.get("min", center)
+            hi = info.get("max", center)
+            if lo is None or hi is None:
+                sampled[name] = center
+                continue
+            lo_f = float(lo)
+            hi_f = float(hi)
+            if hi_f < lo_f:
+                lo_f, hi_f = hi_f, lo_f
+            if hi_f - lo_f <= 1e-6:
+                sampled[name] = center
+            else:
+                sampled[name] = self._random.uniform(lo_f, hi_f)
+        for name, info in ranges.items():
+            if name in sampled:
+                continue
+            lo = info.get("min")
+            hi = info.get("max")
+            if lo is None and hi is None:
+                continue
+            if lo is None:
+                lo = hi
+            if hi is None:
+                hi = lo
+            if lo is None or hi is None:
+                continue
+            lo_f = float(lo)
+            hi_f = float(hi)
+            if hi_f < lo_f:
+                lo_f, hi_f = hi_f, lo_f
+            if hi_f - lo_f <= 1e-6:
+                sampled[name] = lo_f
+            else:
+                sampled[name] = self._random.uniform(lo_f, hi_f)
+        return sampled
 
     # ---- fix6 era-aware helpers ----
     def _extract_release_year(self, item: dict) -> int:
@@ -119,6 +279,9 @@ class RecommendationService:
         self._spotify_client = spotify_client
         self._default_limit = default_limit
         self._market = market
+        self._random = random.Random()
+        self._user_track_history: Dict[str, List[str]] = {}
+        self._history_max = 200
 
     def _sanitize_raw_response(self, raw: dict) -> dict:
         raw = dict(raw or {})
@@ -134,21 +297,38 @@ class RecommendationService:
     def recommend(
         self,
         *,
-        target_features: Optional[Dict[str, float]] = None,
+        target_features: Optional[Dict[str, Any]] = None,
+        target_feature_ranges: Optional[Dict[str, Any]] = None,
         profile: Optional[Dict[str, float]] = None,
         genres: Optional[List[str]] = None,
         seed_artists: Optional[List[str]] = None,
         limit: Optional[int] = None,
+        user_token: Optional[str] = None,
     ) -> RecommendationResult:
         """Request Spotify recommendations based on the analysed profile."""
 
         if target_features is None and profile is not None:
             target_features = profile
+        declared_ranges = target_feature_ranges if isinstance(target_feature_ranges, dict) else None
+        if target_features is None and declared_ranges is not None:
+            target_features = {}
         if not isinstance(target_features, dict):
             raise ValueError("target_features must be provided as a dict")
 
+        centers, feature_ranges = self._normalize_target_features(target_features, declared_ranges=declared_ranges)
+        if not centers and feature_ranges:
+            centers = {name: info.get("target") for name, info in feature_ranges.items() if isinstance(info, dict)}
+            centers = {name: value for name, value in centers.items() if isinstance(value, (int, float))}
         limit = limit or self._default_limit
-        requested_target_features = dict(target_features)
+        requested_target_features = dict(centers)
+        sampled_target_features = self._sample_target_features(centers, feature_ranges)
+        sanitized_range_payload = {
+            name: {"min": info.get("min"), "max": info.get("max")}
+            for name, info in feature_ranges.items()
+            if isinstance(info, dict) and info.get("min") is not None and info.get("max") is not None
+        }
+
+        user_key = user_token or "__default__"
 
         inferred_genres: List[str] = []
         seen_genres = set()
@@ -203,15 +383,38 @@ class RecommendationService:
         )
         seed_artist_ids = list(resolved_artist_ids.values())
 
+        target_payload = sampled_target_features or requested_target_features
+        if not target_payload:
+            target_payload = requested_target_features
         raw_response, applied_features, used_genres = self._spotify_client.get_recommendations(
-            target_features=target_features,
+            target_features=target_payload,
+            feature_ranges=feature_ranges,
             seed_genres=normalized_seed_genres,
             seed_artists=seed_artist_ids,
             limit=limit,
             market=self._market,
         )
         raw_response = self._sanitize_raw_response(raw_response)
-        response_target_features = dict(raw_response.get("target_features") or requested_target_features)
+        if sanitized_range_payload and not raw_response.get("target_feature_ranges"):
+            raw_response["target_feature_ranges"] = sanitized_range_payload
+        raw_response["requested_target_features"] = dict(requested_target_features)
+        if sampled_target_features:
+            raw_response.setdefault("sampled_target_features", dict(sampled_target_features))
+        if feature_ranges and not raw_response.get("target_feature_ranges"):
+            raw_response["target_feature_ranges"] = {
+                name: {"min": info.get("min"), "max": info.get("max")}
+                for name, info in feature_ranges.items()
+                if isinstance(info, dict)
+            }
+        if not applied_features:
+            applied_features = dict(target_payload)
+        response_target_features = dict(
+            raw_response.get("target_features")
+            or applied_features
+            or requested_target_features
+        )
+        if not raw_response.get("target_features"):
+            raw_response["target_features"] = dict(response_target_features)
         jitter_hint = raw_response.get("per_track_jitter_hint")
         if not used_genres:
             used_genres = normalized_seed_genres.copy()
@@ -404,16 +607,25 @@ class RecommendationService:
         track_ids = [item.get("id") for item in raw_tracks if item.get("id")]
         if track_ids:
             audio_features_map = self._spotify_client.get_audio_features(track_ids)
+        extra_margin = 5 if len(raw_tracks) > limit else 0
+        rank_limit = min(len(raw_tracks), limit + extra_margin) if raw_tracks else limit
         ranked_tracks = self._rank_tracks(
             raw_tracks,
             audio_features_map,
             response_target_features,
             jitter_hint=jitter_hint,
+            limit=rank_limit,
+        )
+        filtered_ranked_tracks = self._apply_history_filter(
+            ranked_tracks,
+            base_pool=list(raw_tracks),
+            search_terms=search_terms,
+            user_key=user_key,
             limit=limit,
         )
 
         tracks: List[Track] = []
-        for item in ranked_tracks:
+        for item in filtered_ranked_tracks:
             track_id = item.get("id")
             if not track_id:
                 continue
@@ -435,6 +647,8 @@ class RecommendationService:
                     summary=summary,
                 )
             )
+
+        self._remember_tracks(user_key, [track.id for track in tracks])
 
         if not matched_seed_artists and seed_artist_names:
             matched_seed_artists = seed_artist_names.copy()
@@ -544,6 +758,73 @@ class RecommendationService:
                 if len(supplements) >= take:
                     return supplements
         return supplements
+
+    def _apply_history_filter(
+        self,
+        ranked: List[dict],
+        *,
+        base_pool: List[dict],
+        search_terms: List[str],
+        user_key: str,
+        limit: int,
+    ) -> List[dict]:
+        if not ranked:
+            return []
+        history = [track_id for track_id in self._user_track_history.get(user_key, []) if track_id]
+        history_set = set(history)
+        seen_ids: set[str] = set()
+        filtered: List[dict] = []
+        leftovers: List[dict] = []
+        for track in ranked:
+            track_id = track.get("id")
+            if not track_id or track_id in seen_ids:
+                continue
+            seen_ids.add(track_id)
+            if track_id in history_set:
+                leftovers.append(track)
+                continue
+            filtered.append(track)
+            if len(filtered) >= limit:
+                break
+
+        if len(filtered) < limit and search_terms:
+            supplements = self._augment_from_search_terms(
+                terms=search_terms,
+                existing=base_pool + ranked,
+                market=self._market,
+                limit=max(limit * 2, 10),
+            )
+            for track in supplements:
+                track_id = track.get("id")
+                if not track_id or track_id in seen_ids or track_id in history_set:
+                    continue
+                seen_ids.add(track_id)
+                filtered.append(track)
+                if len(filtered) >= limit:
+                    break
+
+        if len(filtered) < limit:
+            existing_ids = {item.get("id") for item in filtered}
+            for track in leftovers:
+                track_id = track.get("id")
+                if not track_id or track_id in existing_ids:
+                    continue
+                filtered.append(track)
+                existing_ids.add(track_id)
+                if len(filtered) >= limit:
+                    break
+
+        return filtered[:limit]
+
+    def _remember_tracks(self, user_key: str, track_ids: List[str]) -> None:
+        if not track_ids:
+            return
+        history = self._user_track_history.setdefault(user_key, [])
+        for track_id in track_ids:
+            if track_id:
+                history.append(track_id)
+        if len(history) > self._history_max:
+            del history[:-self._history_max]
 
     def _rank_tracks(
         self,

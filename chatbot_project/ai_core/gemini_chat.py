@@ -23,6 +23,7 @@ class GeminiResponse:
     type: str
     message: str
     target_features: Optional[Dict[str, float]] = None
+    target_feature_ranges: Optional[Dict[str, Dict[str, float]]] = None
     genres: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -30,6 +31,7 @@ class GeminiResponse:
             "type": self.type,
             "message": self.message,
             "target_features": self.target_features,
+            "target_feature_ranges": self.target_feature_ranges,
             "genres": self.genres or [],
         }
 
@@ -46,6 +48,7 @@ class GeminiMusicChat:
 
         self.analysis_ready = False
         self.target_features: Optional[Dict[str, float]] = None
+        self.target_feature_ranges: Optional[Dict[str, Dict[str, float]]] = None
         self.target_genres: List[str] = []
 
         genai.configure(api_key=self._api_key)
@@ -62,6 +65,7 @@ class GeminiMusicChat:
 
         self.analysis_ready = False
         self.target_features = None
+        self.target_feature_ranges = None
         self.target_genres = []
         self._chat = self._model.start_chat(history=[])
 
@@ -91,6 +95,8 @@ class GeminiMusicChat:
         if isinstance(analysis_payload, dict) and analysis_payload.get("ready"):
             self.analysis_ready = True
             self.target_features = analysis_payload.get("target_features")
+            ranges = analysis_payload.get("target_feature_ranges")
+            self.target_feature_ranges = ranges if isinstance(ranges, dict) else None
             self.target_genres = analysis_payload.get("genres", [])
 
             clean_message = self._strip_json_block(bot_message).strip() or (
@@ -101,6 +107,7 @@ class GeminiMusicChat:
                 type="analysis_complete",
                 message=clean_message,
                 target_features=self.target_features,
+                target_feature_ranges=self.target_feature_ranges,
                 genres=self.target_genres,
             )
 
@@ -135,6 +142,7 @@ class GeminiMusicChat:
 
         return {
             "target_features": self.target_features,
+            "target_feature_ranges": self.target_feature_ranges,
             "genres": self.target_genres,
         }
 
