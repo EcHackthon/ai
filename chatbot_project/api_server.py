@@ -36,7 +36,7 @@ recommendation_service = RecommendationService(
 chat_sessions: Dict[str, GeminiMusicChat] = {}
 
 # 백엔드 서버 URL
-BACKEND_SERVER_URL = "http://localhost:4000"
+BACKEND_SERVER_URL = "https://back-ieck.onrender.com"
 
 
 def get_or_create_chat_session(session_id: str) -> GeminiMusicChat:

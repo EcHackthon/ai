@@ -168,7 +168,7 @@ def run_cli(limit: Optional[int] = None) -> None:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         try:
             response = requests.post(
-                "http://localhost:4000/api/recommend",
+                "https://back-ieck.onrender.com/api/recommend",
                 json=payload,
                 timeout=5
             )

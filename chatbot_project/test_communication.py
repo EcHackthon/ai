@@ -13,9 +13,9 @@ import json
 import time
 from typing import Optional
 
-# 서버 주소 설정
-AI_SERVER_URL = "http://localhost:5000"
-BACKEND_SERVER_URL = "http://localhost:4000"
+# 서버 주소 설정 (배포 환경)
+AI_SERVER_URL = "http://localhost:5000"  # AI 서버는 로컬에서만 실행
+BACKEND_SERVER_URL = "https://back-ieck.onrender.com"
 
 # 테스트 메시지
 TEST_MESSAGES = [
