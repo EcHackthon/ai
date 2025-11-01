@@ -27,6 +27,7 @@ class Settings:
     spotify_market: str = "US"
     spotify_default_seed_genres: Tuple[str, ...] = tuple()
     gemini_model: str = "gemini-2.0-flash-exp"
+    gemini_verifier_model: str = "gemini-2.0-pro-exp"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -64,6 +65,8 @@ class Settings:
             spotify_redirect_uri=os.getenv("SPOTIFY_REDIRECT_URI"),
             spotify_market=os.getenv("SPOTIFY_MARKET", "US"),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp"),
+            gemini_verifier_model=os.getenv("GEMINI_VERIFIER_MODEL")
+            or os.getenv("GEMINI_MODEL", "gemini-2.0-pro-exp"),
             spotify_default_seed_genres=default_seed_genres,
         )
 

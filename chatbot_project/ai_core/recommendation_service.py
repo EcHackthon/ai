@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from statistics import mean
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from .models import RecommendationResult, Track, track_to_payload
+from .playlist_verifier import PlaylistVerifierProtocol, PlaylistVerifierResult
 from .spotify_client import ArtistLite, SpotifyClient
 
 
@@ -115,10 +116,16 @@ class RecommendationService:
         *,
         default_limit: int = 5,
         market: Optional[str] = None,
+        playlist_verifier: Optional[PlaylistVerifierProtocol] = None,
+        candidate_pool_size: int = 100,
+        verifier_window: int = 25,
     ) -> None:
         self._spotify_client = spotify_client
         self._default_limit = default_limit
         self._market = market
+        self._playlist_verifier = playlist_verifier
+        self._candidate_pool_size = max(5, min(candidate_pool_size, 100))
+        self._verifier_window = max(5, verifier_window)
 
     def _sanitize_raw_response(self, raw: dict) -> dict:
         raw = dict(raw or {})
@@ -147,7 +154,9 @@ class RecommendationService:
         if not isinstance(target_features, dict):
             raise ValueError("target_features must be provided as a dict")
 
-        limit = limit or self._default_limit
+        final_limit = limit or self._default_limit
+        final_limit = max(1, final_limit)
+        candidate_limit = min(max(final_limit, self._candidate_pool_size), 100)
         requested_target_features = dict(target_features)
 
         inferred_genres: List[str] = []
@@ -207,7 +216,7 @@ class RecommendationService:
             target_features=target_features,
             seed_genres=normalized_seed_genres,
             seed_artists=seed_artist_ids,
-            limit=limit,
+            limit=candidate_limit,
             market=self._market,
         )
         raw_response = self._sanitize_raw_response(raw_response)
@@ -242,13 +251,13 @@ class RecommendationService:
             if pool:
                 scored_pool = [(self._score_item(item, era=era_window), item) for item in pool]
                 scored_pool.sort(key=lambda pair: pair[0], reverse=True)
-                raw_tracks = [item for _, item in scored_pool[:limit]]
+                raw_tracks = [item for _, item in scored_pool[:candidate_limit]]
             ## fix6_fallback_search_end
             if not raw_tracks:
                 raw_tracks = self._augment_from_search_terms(
                     terms=search_terms,
                     existing=raw_tracks,
-                    limit=limit,
+                    limit=candidate_limit,
                     market=self._market,
                 ) or original_tracks
 
@@ -304,9 +313,9 @@ class RecommendationService:
         feat_map: Dict[str, Dict[str, float]] = {}
         if raw_tracks:
             stage = apply_filters(raw_tracks, 55, market_val)
-            if len(stage) < limit:
+            if len(stage) < candidate_limit:
                 stage = apply_filters(raw_tracks, 50, market_val)
-            if len(stage) < limit:
+            if len(stage) < candidate_limit:
                 stage = apply_filters(raw_tracks, 45, market_val)
         if stage:
             feats_list = self._spotify_client.get_audio_features([track["id"] for track in stage])
@@ -320,24 +329,24 @@ class RecommendationService:
                 popularity_bonus = float(track.get("popularity") or 0) / 200.0
                 scored_stage.append((-distance + popularity_bonus, track))
             scored_stage.sort(key=lambda pair: pair[0], reverse=True)
-            raw_tracks = [track for _, track in scored_stage[:limit]]
+            raw_tracks = [track for _, track in scored_stage[:candidate_limit]]
         ## fix61_vibe_postproc_end
-        if len(raw_tracks) < limit:
+        if len(raw_tracks) < candidate_limit:
             supplements = self._augment_from_search_terms(
                 terms=search_terms,
                 existing=raw_tracks,
                 market=self._market,
-                limit=limit - len(raw_tracks),
+                limit=candidate_limit - len(raw_tracks),
             )
             if supplements:
                 raw_tracks.extend(supplements)
                 raw_tracks = apply_filters(raw_tracks, 40, market_val)
-                if len(raw_tracks) < limit:
+                if len(raw_tracks) < candidate_limit:
                     refill = self._augment_from_search_terms(
                         terms=search_terms,
                         existing=raw_tracks,
                         market=self._market,
-                        limit=limit - len(raw_tracks),
+                        limit=candidate_limit - len(raw_tracks),
                     )
                     if refill:
                         raw_tracks.extend(refill)
@@ -358,11 +367,11 @@ class RecommendationService:
                             matched_seed_artists.append(name)
             if filtered_tracks:
                 raw_tracks = filtered_tracks
-            if seed_artist_ids and len(raw_tracks) < limit:
+            if seed_artist_ids and len(raw_tracks) < candidate_limit:
                 fallback_tracks = self._spotify_client.get_artist_top_tracks(
                     seed_artist_ids,
                     market=self._market,
-                    limit=limit * 2,
+                    limit=min(candidate_limit * 2, 100),
                 )
                 extra: List[dict] = []
                 seen_ids = {item.get("id") for item in raw_tracks if item.get("id")}
@@ -372,7 +381,7 @@ class RecommendationService:
                         continue
                     seen_ids.add(track_id)
                     extra.append(track)
-                    if len(raw_tracks) + len(extra) >= limit:
+                    if len(raw_tracks) + len(extra) >= candidate_limit:
                         break
                     artist_names = [artist.get("name", "") for artist in track.get("artists", [])]
                     for name in artist_names:
@@ -385,17 +394,17 @@ class RecommendationService:
                 fallback_tracks = self._spotify_client.get_artist_top_tracks(
                     seed_artist_ids,
                     market=self._market,
-                    limit=limit,
+                    limit=candidate_limit,
                 )
                 if fallback_tracks:
                     raw_tracks = fallback_tracks
                     matched_seed_artists = seed_artist_names.copy()
-            if len(raw_tracks) < limit:
+            if len(raw_tracks) < candidate_limit:
                 artist_supplements = self._augment_from_artist_search(
                     seed_artist_names,
                     existing=raw_tracks,
                     market=self._market,
-                    take=limit - len(raw_tracks),
+                    take=candidate_limit - len(raw_tracks),
                 )
                 if artist_supplements:
                     raw_tracks.extend(artist_supplements)
@@ -415,15 +424,82 @@ class RecommendationService:
             audio_features_map,
             response_target_features,
             jitter_hint=jitter_hint,
-            limit=limit,
+            limit=candidate_limit,
         )
 
+        verifier_candidates: List[Dict[str, Any]] = []
+        selected_track_dicts = ranked_tracks[:final_limit]
+        verifier_result: Optional[PlaylistVerifierResult] = None
+
+        if self._playlist_verifier:
+            candidate_window = min(len(ranked_tracks), max(final_limit, self._verifier_window))
+            candidate_slice = ranked_tracks[:candidate_window]
+            if candidate_slice:
+                verifier_candidates = self._prepare_verifier_candidates(
+                    candidate_slice,
+                    audio_features_map,
+                    response_target_features,
+                    inferred_genres,
+                )
+                if verifier_candidates:
+                    mood_payload = self._build_mood_profile_payload(
+                        target_features=response_target_features,
+                        raw_response=raw_response,
+                        inferred_genres=inferred_genres,
+                        seed_artists=seed_artist_names,
+                    )
+                    verifier_result = self._playlist_verifier.select_tracks(
+                        mood_profile=mood_payload,
+                        candidates=verifier_candidates,
+                        limit=final_limit,
+                    )
+                    if verifier_result.track_ids:
+                        id_to_track = {
+                            track.get("id"): track
+                            for track in candidate_slice
+                            if track.get("id")
+                        }
+                        selected: List[dict] = []
+                        seen_ids: set[str] = set()
+                        for track_id in verifier_result.track_ids:
+                            track = id_to_track.get(track_id)
+                            if track and track_id not in seen_ids:
+                                selected.append(track)
+                                seen_ids.add(track_id)
+                        if len(selected) < final_limit:
+                            for track in candidate_slice:
+                                track_id = track.get("id")
+                                if not track_id or track_id in seen_ids:
+                                    continue
+                                selected.append(track)
+                                seen_ids.add(track_id)
+                                if len(selected) >= final_limit:
+                                    break
+                        if selected:
+                            selected_track_dicts = selected[:final_limit]
+
+        if verifier_result:
+            verifier_section: Dict[str, Any] = {
+                "selected_track_ids": verifier_result.track_ids,
+            }
+            if verifier_candidates:
+                candidate_ids = [c.get("id") for c in verifier_candidates if c.get("id")]
+                if candidate_ids:
+                    verifier_section["candidate_ids"] = candidate_ids
+            if verifier_result.notes:
+                verifier_section["notes"] = verifier_result.notes
+            if verifier_result.raw_text:
+                verifier_section["raw_text"] = verifier_result.raw_text
+            if verifier_result.parsed:
+                verifier_section["parsed"] = verifier_result.parsed
+            raw_response["verifier"] = verifier_section
+
         tracks: List[Track] = []
-        for item in ranked_tracks:
+        for item in selected_track_dicts:
             track_id = item.get("id")
             if not track_id:
                 continue
-            
+
             # 상세 정보에서 preview_url 가져오기
             track_details = tracks_details_map.get(track_id, {})
             preview_url = track_details.get("preview_url") or item.get("preview_url")
@@ -711,3 +787,62 @@ class RecommendationService:
             return None
 
         return " | ".join(components) + "."
+
+    def _build_mood_profile_payload(
+        self,
+        *,
+        target_features: Dict[str, float],
+        raw_response: Dict[str, Any],
+        inferred_genres: Sequence[str],
+        seed_artists: Sequence[str],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "target_features": target_features,
+        }
+        ranges = raw_response.get("target_feature_ranges")
+        if isinstance(ranges, dict) and ranges:
+            payload["target_feature_ranges"] = ranges
+        if inferred_genres:
+            payload["inferred_genres"] = list(inferred_genres)
+        if seed_artists:
+            payload["seed_artists"] = list(seed_artists)
+        diversity_hint = raw_response.get("diversity_hint")
+        if isinstance(diversity_hint, dict) and diversity_hint:
+            payload["diversity_hint"] = diversity_hint
+        jitter_hint = raw_response.get("per_track_jitter_hint")
+        if isinstance(jitter_hint, dict) and jitter_hint:
+            payload["per_track_jitter_hint"] = jitter_hint
+        return payload
+
+    def _prepare_verifier_candidates(
+        self,
+        tracks: Sequence[dict],
+        audio_features_map: Dict[str, Dict[str, float]],
+        target_features: Dict[str, float],
+        genres: Sequence[str],
+    ) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        for index, track in enumerate(tracks):
+            track_id = track.get("id")
+            if not track_id:
+                continue
+            features = audio_features_map.get(track_id) or {}
+            artist_names = [
+                artist.get("name")
+                for artist in track.get("artists", [])
+                if isinstance(artist, dict) and artist.get("name")
+            ]
+            candidate: Dict[str, Any] = {
+                "id": track_id,
+                "name": track.get("name"),
+                "artists": artist_names,
+                "popularity": track.get("popularity"),
+                "features": features,
+                "distance_to_target": self._feature_distance(features, target_features),
+                "rank": index + 1,
+            }
+            summary = self._summarize_track(features, list(genres))
+            if summary:
+                candidate["summary"] = summary
+            candidates.append(candidate)
+        return candidates
