@@ -65,13 +65,13 @@ class StrictGeminiMusicChat:
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel(
             model_name,
-            system_instruction=SYSTEM_PROMPT,
             generation_config={
                 "temperature": 0.7,
                 "top_p": 0.9,
                 "max_output_tokens": 2048,
             },
         )
+        self._system_prompt = SYSTEM_PROMPT
         self.history: List[Dict[str, str]] = []
         self.analysis_ready: bool = False
         self._target_features: Optional[Dict[str, float]] = None
@@ -90,13 +90,16 @@ class StrictGeminiMusicChat:
         self._per_track_jitter_hint = None
 
     def _gen(self, text: str) -> str:
-        parts = []
+        segments = [f"<SYSTEM>\n{self._system_prompt}\n</SYSTEM>"]
         if self.history:
             for turn in self.history[-8:]:
-                parts.append({"role": "user", "parts": [turn["user"]]})
-                parts.append({"role": "model", "parts": [turn["assistant"]]})
-        parts.append({"role": "user", "parts": [text]})
-        resp = self.model.generate_content(parts)
+                user_msg = turn.get("user", "")
+                assistant_msg = turn.get("assistant", "")
+                segments.append(f"<USER>\n{user_msg}\n</USER>")
+                segments.append(f"<ASSISTANT>\n{assistant_msg}\n</ASSISTANT>")
+        segments.append(f"<USER>\n{text}\n</USER>")
+        prompt = "\n\n".join(segments)
+        resp = self.model.generate_content(prompt)
         return getattr(resp, "text", "") or ""
 
     def send_message(self, text: str) -> GeminiResponse:
