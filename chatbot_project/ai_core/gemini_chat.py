@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -37,11 +38,13 @@ class GeminiResponse:
 class GeminiMusicChat:
     """Gemini 모델과 대화를 이어가고 상태를 기억하면 됨."""
 
-    def __init__(self, *, api_key: Optional[str] = None, model_name: str = "gemini-2.0-flash-exp"):
+    def __init__(self, *, api_key: Optional[str] = None, model_name: Optional[str] = None):
         if not api_key:
             raise ValueError("Gemini API key must be supplied.")
 
-        self._model_name = model_name
+        resolved_model = model_name or os.getenv("GEMINI_MODEL") or "gemini-2.0-flash-exp"
+
+        self._model_name = resolved_model
         self._api_key = api_key
 
         self.analysis_ready = False

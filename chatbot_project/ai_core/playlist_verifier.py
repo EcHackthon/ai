@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 
@@ -61,15 +62,21 @@ class GeminiPlaylistVerifier:
         self,
         *,
         api_key: str,
-        model_name: str = "gemini-1.5-pro",
+        model_name: Optional[str] = None,
         max_candidates: int = 25,
     ) -> None:
         if not api_key:
             raise ValueError("Gemini API key must be provided for playlist verification.")
 
         genai.configure(api_key=api_key)
+        resolved_model = (
+            model_name
+            or os.getenv("GEMINI_VERIFIER_MODEL")
+            or os.getenv("GEMINI_MODEL")
+            or "gemini-2.0-pro-exp"
+        )
         self._model = genai.GenerativeModel(
-            model_name,
+            resolved_model,
             generation_config={
                 "temperature": 0.45,
                 "top_p": 0.9,
@@ -78,6 +85,7 @@ class GeminiPlaylistVerifier:
         )
         self._system_prompt = _VERIFIER_SYSTEM_PROMPT
         self._max_candidates = max(5, max_candidates)
+        self._model_name = resolved_model
 
     def select_tracks(
         self,
@@ -117,7 +125,7 @@ class GeminiPlaylistVerifier:
             logger.warning("Gemini playlist verifier call failed: %s", error)
             return PlaylistVerifierResult(track_ids=[])
 
-        raw_text = getattr(response, "text", "") or ""
+        raw_text = self._extract_response_text(response)
         data = parse_json_safely(raw_text)
         track_ids: List[str] = []
         notes: Optional[str] = None
@@ -189,3 +197,42 @@ class GeminiPlaylistVerifier:
             payload["summary"] = summary.strip()
 
         return {key: value for key, value in payload.items() if value not in (None, [], {})}
+
+    def _extract_response_text(self, response: Any) -> str:
+        """Gemini SDK 응답에서 텍스트를 최대한 안전하게 추출."""
+
+        if response is None:
+            return ""
+
+        # 최신 SDK에서는 ``response.text`` 가 단순 텍스트일 때만 동작한다.
+        text_value = getattr(response, "text", None)
+        if isinstance(text_value, str) and text_value.strip():
+            return text_value
+
+        candidates = getattr(response, "candidates", None) or []
+        collected_parts: List[str] = []
+
+        for candidate in candidates:
+            # ``candidate.content.parts`` 또는 ``candidate.parts`` 에 텍스트 파트가 존재할 수 있다.
+            content = getattr(candidate, "content", None)
+            parts = None
+            if content is not None:
+                parts = getattr(content, "parts", None)
+            if not parts:
+                parts = getattr(candidate, "parts", None)
+
+            if not parts:
+                continue
+
+            for part in parts:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str) and part_text.strip():
+                    collected_parts.append(part_text.strip())
+
+        if collected_parts:
+            return "\n".join(collected_parts)
+
+        try:
+            return str(response)
+        except Exception:  # pragma: no cover - 예외적 객체 표현 방어
+            return ""

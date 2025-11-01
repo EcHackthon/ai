@@ -59,7 +59,7 @@ class StrictGeminiMusicChat:
             model_name = model_name or getattr(settings, "gemini_model", None)
 
         api_key = api_key or os.getenv("GEMINI_API_KEY")
-        model_name = model_name or os.getenv("GEMINI_MODEL") or "gemini-1.5-pro"
+        model_name = model_name or os.getenv("GEMINI_MODEL") or "gemini-2.0-flash-exp"
         if not api_key:
             raise RuntimeError("Gemini API key missing. Set settings.gemini_api_key or GEMINI_API_KEY.")
         genai.configure(api_key=api_key)
