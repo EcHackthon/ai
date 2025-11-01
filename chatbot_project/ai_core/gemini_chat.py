@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -37,11 +38,13 @@ class GeminiResponse:
 class GeminiMusicChat:
     """Gemini 모델과 대화를 이어가고 상태를 기억하면 됨."""
 
-    def __init__(self, *, api_key: Optional[str] = None, model_name: str = "gemini-2.0-flash-exp"):
+    def __init__(self, *, api_key: Optional[str] = None, model_name: Optional[str] = None):
         if not api_key:
             raise ValueError("Gemini API key must be supplied.")
 
-        self._model_name = model_name
+        resolved_model = model_name or os.getenv("GEMINI_MODEL") or "gemini-2.0-flash-exp"
+
+        self._model_name = resolved_model
         self._api_key = api_key
 
         self.analysis_ready = False
@@ -50,11 +53,9 @@ class GeminiMusicChat:
 
         genai.configure(api_key=self._api_key)
 
-        self._model = genai.GenerativeModel(
-            self._model_name,
-            system_instruction=SYSTEM_PROMPT,
-        )
-        self._chat = self._model.start_chat(history=[])
+        self._model = genai.GenerativeModel(self._model_name)
+        self._system_prompt = SYSTEM_PROMPT
+        self._history: List[Dict[str, str]] = []
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
@@ -63,14 +64,14 @@ class GeminiMusicChat:
         self.analysis_ready = False
         self.target_features = None
         self.target_genres = []
-        self._chat = self._model.start_chat(history=[])
+        self._history.clear()
 
     # ------------------------------------------------------------------
     def send_message(self, user_message: str) -> GeminiResponse:
         """사용자 메시지를 Gemini에 전달하고 응답을 해석하면 됨."""
 
         try:
-            response = self._chat.send_message(user_message)
+            response = self._model.generate_content(self._build_prompt(user_message))
         except Exception as error:
             logger.exception("Gemini 호출이 실패했음: %s", error)
             return GeminiResponse(
@@ -97,6 +98,8 @@ class GeminiMusicChat:
                 "분석이 완료되었습니다! 잠시 후 추천을 준비할게요."
             )
 
+            self._history.append({"user": user_message, "assistant": bot_message})
+
             return GeminiResponse(
                 type="analysis_complete",
                 message=clean_message,
@@ -106,7 +109,17 @@ class GeminiMusicChat:
 
         clean_message = self._strip_json_block(bot_message).strip() or bot_message
 
+        self._history.append({"user": user_message, "assistant": bot_message})
+
         return GeminiResponse(type="conversation", message=clean_message, genres=[])
+
+    def _build_prompt(self, user_message: str) -> str:
+        segments = [f"<SYSTEM>\n{self._system_prompt}\n</SYSTEM>"]
+        for turn in self._history[-6:]:
+            segments.append(f"<USER>\n{turn.get('user', '')}\n</USER>")
+            segments.append(f"<ASSISTANT>\n{turn.get('assistant', '')}\n</ASSISTANT>")
+        segments.append(f"<USER>\n{user_message}\n</USER>")
+        return "\n\n".join(segments)
 
     # ------------------------------------------------------------------
     @staticmethod
