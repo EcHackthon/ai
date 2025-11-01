@@ -12,6 +12,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from ai_core.config import Settings
+from ai_core.playlist_verifier import GeminiPlaylistVerifier
 from ai_core.strict_chat import StrictGeminiMusicChat as GeminiMusicChat
 from ai_core.recommendation_service import RecommendationService
 from ai_core.spotify_client import SpotifyClient, SpotifyAuthError
@@ -55,10 +56,21 @@ def run_cli(limit: Optional[int] = None) -> None:
 
     chat = GeminiMusicChat(api_key=settings.gemini_api_key, model_name=settings.gemini_model)
     spotify_client = SpotifyClient(settings)
+    playlist_verifier = None
+    try:
+        verifier_model = getattr(settings, "gemini_verifier_model", settings.gemini_model)
+        playlist_verifier = GeminiPlaylistVerifier(
+            api_key=settings.gemini_api_key,
+            model_name=verifier_model,
+        )
+        logger.info("Gemini playlist verifier 활성화됨 (model=%s)", verifier_model)
+    except Exception as exc:
+        logger.warning("Gemini playlist verifier 를 초기화하지 못했습니다: %s", exc)
     recommendation_service = RecommendationService(
         spotify_client,
         default_limit=limit or 5,
         market=settings.spotify_market,
+        playlist_verifier=playlist_verifier,
     )
 
     print("=" * 60)
@@ -132,10 +144,21 @@ def create_flask_app() -> Flask:
     settings = Settings.from_env()
     _app_chat = GeminiMusicChat(api_key=settings.gemini_api_key, model_name=settings.gemini_model)
     spotify_client = SpotifyClient(settings)
+    playlist_verifier = None
+    try:
+        verifier_model = getattr(settings, "gemini_verifier_model", settings.gemini_model)
+        playlist_verifier = GeminiPlaylistVerifier(
+            api_key=settings.gemini_api_key,
+            model_name=verifier_model,
+        )
+        logger.info("Gemini playlist verifier 활성화됨 (model=%s)", verifier_model)
+    except Exception as exc:
+        logger.warning("Gemini playlist verifier 를 초기화하지 못했습니다: %s", exc)
     _app_recommendation_service = RecommendationService(
         spotify_client,
         default_limit=5,
         market=settings.spotify_market,
+        playlist_verifier=playlist_verifier,
     )
     
     @app.route('/api/health', methods=['GET'])
