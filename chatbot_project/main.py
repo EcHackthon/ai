@@ -1,24 +1,17 @@
-"""CLI 데모 애플리케이션 + Flask API 서버를 실행하려면 이 모듈을 사용하면 됨."""
+"""CLI 데모 애플리케이션을 실행하려면 이 모듈을 사용하면 됨."""
 
 from __future__ import annotations
 
 import requests
 import argparse
 import json
-import logging
 from typing import Optional
-
-from flask import Flask, request, jsonify
-from flask_cors import CORS
 
 from ai_core.config import Settings
 from ai_core.strict_chat import StrictGeminiMusicChat as GeminiMusicChat
 from ai_core.recommendation_service import RecommendationService
 from ai_core.spotify_client import SpotifyClient, SpotifyAuthError
-
-# 로깅 설정
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from ai_core.artist_inference import infer_seed_artists, normalize_artist_list
 
 
 def _print_recommendations(payload: dict) -> None:
@@ -68,6 +61,10 @@ def run_cli(limit: Optional[int] = None) -> None:
     print("종료하려면 'quit' 또는 'exit'를 입력하면 됨.")
     print("=" * 60)
 
+    # 이전 추천 결과 저장 (같은 아티스트의 다른 노래를 요청할 때 사용)
+    previous_seed_artists: Optional[list[str]] = None
+    previous_track_ids: set[str] = set()
+
     while True:
         user_input = input("🧑 You: ").strip()
         if user_input.lower() in {"quit", "exit"}:
@@ -83,15 +80,68 @@ def run_cli(limit: Optional[int] = None) -> None:
         if gemini_response.type != "analysis_complete":
             continue
 
+        conversation_snippets = []
+        history = getattr(chat, "history", []) or []
+        for turn in history[-8:]:
+            user_turn = turn.get("user")
+            if isinstance(user_turn, str) and user_turn.strip():
+                conversation_snippets.append(user_turn.strip())
+        if user_input:
+            conversation_snippets.append(user_input)
+        
+        # "다른 X 노래", "X 노래 더" 같은 패턴 감지
+        user_input_lower = user_input.lower()
+        is_continuation_request = any(
+            keyword in user_input_lower
+            for keyword in ["다른", "더", "추가", "another", "more", "other"]
+        )
+
+        # Gemini의 seed_artists는 완전히 무시하고, 사용자 입력에서만 아티스트 추출
+        # 이전에 1명의 아티스트만 추천했고, 계속 같은 아티스트 요청이면 유지
+        if previous_seed_artists and len(previous_seed_artists) == 1 and (
+            is_continuation_request or
+            any(artist.lower() in user_input_lower for artist in previous_seed_artists)
+        ):
+            # 이전 아티스트를 강제로 유지
+            inferred_artists = normalize_artist_list(previous_seed_artists)
+            print(f"🔒 이전 아티스트 유지: {', '.join(inferred_artists)}")
+        else:
+            # 사용자 입력에서 직접 아티스트 추출 (Gemini 무시)
+            inferred_artists = infer_seed_artists(
+                conversation=[user_input],  # 현재 입력만 사용
+                genres=None,  # 장르는 무시
+                existing_artists=None,
+                max_artists=1,  # 최대 1명만
+                min_artists=0,  # 지정 안되어 있어도 OK
+            )
+            # 추출된 아티스트가 없으면 fallback 사용
+            if not inferred_artists:
+                # 아티스트가 명시되지 않은 경우 빈 리스트 (장르만으로 추천)
+                inferred_artists = []
+            else:
+                inferred_artists = normalize_artist_list(inferred_artists)
+
+        # Gemini의 seed_artists를 강제로 덮어쓰기
+        gemini_response.seed_artists = inferred_artists
+
         if not gemini_response.target_features:
             print("⚠️ 타겟 오디오 특징이 누락되었습니다. 다시 시도해주세요.")
             continue
 
         try:
+            # 이전에 추천한 곡들을 제외하고 새로운 곡들만 추천 받음
+            exclude_track_ids = (
+                list(previous_track_ids)
+                if previous_seed_artists and len(previous_seed_artists) == 1 and previous_track_ids
+                else []
+            )
+            
             recommendation_result = recommendation_service.recommend(
                 target_features=gemini_response.target_features,
+                target_feature_ranges=getattr(gemini_response, 'target_feature_ranges', None),
                 genres=gemini_response.genres,
-                seed_artists=getattr(gemini_response, 'seed_artists', None),
+                seed_artists=gemini_response.seed_artists,
+                exclude_track_ids=exclude_track_ids or None,
             )
         except SpotifyAuthError as exc:
             print(f"❌ Spotify 인증 오류: {exc}")
@@ -99,6 +149,20 @@ def run_cli(limit: Optional[int] = None) -> None:
 
         payload = recommendation_service.build_backend_payload(recommendation_result)
         _print_recommendations(payload)
+
+        # 이전 추천 결과 저장 (다음 요청에서 같은 아티스트 유지하기 위해)
+        if payload.get("seed_artists"):
+            # 정규화하여 저장 (중복 제거)
+            previous_seed_artists = normalize_artist_list(payload["seed_artists"])
+            # 이번에 추천된 트랙 IDs 저장 (중복 방지)
+            previous_track_ids = {
+                track.get("id") 
+                for track in payload.get("tracks", []) 
+                if track.get("id")
+            }
+        else:
+            previous_seed_artists = None
+            previous_track_ids = set()
 
         print("\n백엔드 전송용 JSON:")
         print(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -114,153 +178,23 @@ def run_cli(limit: Optional[int] = None) -> None:
             print("❌ 백엔드 전송 실패:", exc)
 
 
-# 전역 변수로 선언
-_app_chat = None
-_app_recommendation_service = None
-_app_backend_url = "http://localhost:4000"
-
-
-def create_flask_app() -> Flask:
-    """Flask API 서버를 생성하면 됨."""
+def run_server() -> None:
+    """Flask API 서버를 실행합니다."""
+    from ai_core.config import Settings
     
-    global _app_chat, _app_recommendation_service
-    
-    app = Flask(__name__)
-    CORS(app)  # CORS 활성화
-    
-    # 전역 설정 및 인스턴스
     settings = Settings.from_env()
-    _app_chat = GeminiMusicChat(api_key=settings.gemini_api_key, model_name=settings.gemini_model)
-    spotify_client = SpotifyClient(settings)
-    _app_recommendation_service = RecommendationService(
-        spotify_client,
-        default_limit=5,
-        market=settings.spotify_market,
-    )
     
-    @app.route('/api/health', methods=['GET'])
-    def health_check():
-        """서버 상태 확인"""
-        return jsonify({"status": "ok", "message": "AI server is running"})
+    print("=" * 60)
+    print("🚀 AI API 서버를 시작합니다...")
+    print("📍 서버 주소: http://localhost:5000")
+    print("📍 Health check: http://localhost:5000/api/health")
+    print("📍 Chat endpoint: POST http://localhost:5000/api/chat")
+    print("📍 Reset endpoint: POST http://localhost:5000/api/chat/reset")
+    print("=" * 60)
     
-    @app.route('/api/chat', methods=['POST'])
-    def chat_endpoint():
-        """
-        백엔드에서 사용자 메시지를 받아 Gemini에 전달하고 응답을 반환합니다.
-        """
-        try:
-            logger.info("=== Chat endpoint called ===")
-            data = request.get_json()
-            logger.info(f"Received data: {data}")
-            
-            if not data or 'message' not in data:
-                logger.error("No message in request")
-                return jsonify({
-                    "type": "error",
-                    "message": "메시지가 필요합니다."
-                }), 400
-            
-            user_message = data['message']
-            session_id = data.get('session_id', 'default')
-            
-            logger.info(f"[Session: {session_id}] User message: {user_message}")
-            logger.info(f"Chat instance: {_app_chat}")
-            logger.info(f"Recommendation service: {_app_recommendation_service}")
-            
-            # Gemini에 메시지 전송
-            logger.info("Calling Gemini API...")
-            try:
-                gemini_response = _app_chat.send_message(user_message)
-                logger.info(f"Gemini response type: {gemini_response.type}")
-            except Exception as gemini_error:
-                error_msg = str(gemini_error)
-                logger.error(f"Gemini API error: {error_msg}")
-                
-                # 할당량 초과 에러 처리
-                if "429" in error_msg or "quota" in error_msg.lower() or "ResourceExhausted" in error_msg:
-                    return jsonify({
-                        "type": "error",
-                        "message": "😅 Gemini API 할당량이 초과되었습니다.\n\n무료 티어는 하루 50개 요청으로 제한됩니다.\n잠시 후 다시 시도해주세요. (약 1분 후)\n\n또는 .env 파일에서 다른 API 키를 사용하거나,\nGemini API 대시보드에서 할당량을 확인해주세요.\n\n🔗 https://ai.dev/usage"
-                    }), 429
-                
-                # 기타 Gemini 에러
-                return jsonify({
-                    "type": "error",
-                    "message": f"Gemini API 오류가 발생했습니다: {error_msg[:200]}"
-                }), 500
-            
-            response_data = {
-                "type": gemini_response.type,
-                "message": gemini_response.message,
-            }
-            
-            # 분석이 완료된 경우 Spotify 추천 생성
-            if gemini_response.type == "analysis_complete" and gemini_response.target_features:
-                try:
-                    recommendation_result = _app_recommendation_service.recommend(
-                        target_features=gemini_response.target_features,
-                        genres=gemini_response.genres,
-                        seed_artists=None,
-                    )
-                    
-                    payload = _app_recommendation_service.build_backend_payload(recommendation_result)
-                    response_data["recommendations"] = payload
-                    
-                    logger.info(f"[Session: {session_id}] Generated {len(payload.get('tracks', []))} recommendations")
-                    
-                    # 백엔드 서버로도 전송 (기존 동작 유지)
-                    try:
-                        backend_response = requests.post(
-                            f"{_app_backend_url}/api/recommend",
-                            json=payload,
-                            timeout=5
-                        )
-                        logger.info(f"✅ 백엔드로 전송 성공: {backend_response.status_code}")
-                    except Exception as exc:
-                        logger.warning(f"⚠️ 백엔드 전송 실패 (무시): {exc}")
-                    
-                except SpotifyAuthError as exc:
-                    logger.error(f"Spotify auth error: {exc}")
-                    response_data["message"] += "\n\n⚠️ Spotify 인증 오류가 발생했습니다."
-                except Exception as exc:
-                    logger.error(f"Recommendation error: {exc}")
-                    response_data["message"] += "\n\n⚠️ 추천 생성 중 오류가 발생했습니다."
-            
-            logger.info(f"Returning response: {response_data}")
-            return jsonify(response_data), 200
-            
-        except Exception as e:
-            logger.exception(f"!!! ERROR in chat endpoint: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            return jsonify({
-                "type": "error",
-                "message": f"서버 오류가 발생했습니다: {str(e)}"
-            }), 500
-    
-    @app.route('/api/chat/reset', methods=['POST'])
-    def reset_chat():
-        """채팅 세션을 초기화합니다."""
-        try:
-            data = request.get_json() or {}
-            session_id = data.get('session_id', 'default')
-            
-            _app_chat.reset()
-            logger.info(f"[Session: {session_id}] Chat reset")
-            
-            return jsonify({
-                "status": "ok",
-                "message": "대화가 초기화되었습니다."
-            }), 200
-            
-        except Exception as e:
-            logger.exception(f"Error in reset endpoint: {e}")
-            return jsonify({
-                "type": "error",
-                "message": "초기화 중 오류가 발생했습니다."
-            }), 500
-    
-    return app
+    # api_server 모듈을 임포트하여 실행
+    import api_server
+    api_server.app.run(host='0.0.0.0', port=5000, debug=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -278,13 +212,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--server",
         action="store_true",
-        help="Flask API 서버 모드로 실행하면 됨.",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=5000,
-        help="API 서버 포트 번호 (기본값: 5000)",
+        help="Flask API 서버 모드로 실행하면 됨 (포트 5000).",
     )
     return parser.parse_args()
 
@@ -293,15 +221,8 @@ if __name__ == "__main__":
     args = parse_args()
     
     if args.server:
-        # Flask 서버 모드
-        app = create_flask_app()
-        print("=" * 60)
-        print("🚀 AI API 서버를 시작합니다...")
-        print(f"📍 서버 주소: http://localhost:{args.port}")
-        print(f"📍 Health check: http://localhost:{args.port}/api/health")
-        print(f"📍 Chat endpoint: POST http://localhost:{args.port}/api/chat")
-        print("=" * 60)
-        app.run(host='0.0.0.0', port=args.port, debug=True)
+        # Flask API 서버 모드
+        run_server()
     else:
-        # CLI 모드
+        # CLI 챗봇 모드
         run_cli(limit=args.limit)

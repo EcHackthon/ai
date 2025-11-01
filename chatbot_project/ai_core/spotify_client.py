@@ -499,26 +499,59 @@ class SpotifyClient:
 
     # ---------- Features ----------
 
-    def _prepare_target_features(self, target_features: Dict[str, float]) -> Tuple[Dict[str, str], Dict[str, float]]:
+    def _prepare_target_features(
+        self,
+        target_features: Dict[str, float],
+        feature_ranges: Optional[Dict[str, Dict[str, float]]] = None,
+    ) -> Tuple[Dict[str, str], Dict[str, float]]:
         applied: Dict[str, float] = {}
         params: Dict[str, str] = {}
-        if not target_features:
-            return params, applied
+        feature_ranges = feature_ranges or {}
 
         def _clamp(name: str, val: float) -> float:
             lo, hi = self._FEATURE_LIMITS.get(name, (-1e9, 1e9))
             return max(lo, min(hi, val))
 
-        for k, v in target_features.items():
-            if v is None:
-                continue
+        def _parse_num(value: Any) -> Optional[float]:
+            if isinstance(value, (int, float)):
+                return float(value)
             try:
-                fv = float(v)
+                return float(value)
             except (TypeError, ValueError):
+                return None
+
+        for k, v in (target_features or {}).items():
+            num = _parse_num(v)
+            if num is None:
                 continue
-            fv = _clamp(k, fv)
+            fv = _clamp(k, num)
             params[f"target_{k}"] = str(fv)
             applied[k] = fv
+
+        for name, info in feature_ranges.items():
+            if not isinstance(info, dict):
+                continue
+            lo = _parse_num(info.get("min"))
+            hi = _parse_num(info.get("max"))
+            if lo is None and hi is None:
+                continue
+            if lo is None:
+                lo = hi
+            if hi is None:
+                hi = lo
+            if lo is None or hi is None:
+                continue
+            lo_c = _clamp(name, float(lo))
+            hi_c = _clamp(name, float(hi))
+            if hi_c < lo_c:
+                lo_c, hi_c = hi_c, lo_c
+            params[f"min_{name}"] = str(lo_c)
+            params[f"max_{name}"] = str(hi_c)
+            target_val = _parse_num(info.get("target"))
+            if target_val is None:
+                target_val = (lo_c + hi_c) / 2.0
+            applied.setdefault(name, _clamp(name, target_val))
+
         return params, applied
 
     # ---------- Recommendations (with fallback) ----------
@@ -527,6 +560,7 @@ class SpotifyClient:
         self,
         *,
         target_features: Dict[str, float],
+        feature_ranges: Optional[Dict[str, Dict[str, float]]] = None,
         seed_genres: Optional[List[str]] = None,
         seed_tracks: Optional[List[str]] = None,
         seed_artists: Optional[List[str]] = None,
@@ -559,7 +593,7 @@ class SpotifyClient:
         if final_artists:
             params["seed_artists"] = ",".join(final_artists)
 
-        feat_params, applied_features = self._prepare_target_features(target_features)
+        feat_params, applied_features = self._prepare_target_features(target_features, feature_ranges)
         params.update(feat_params)
 
         # Try deprecated endpoint (may work on old apps)
@@ -591,47 +625,6 @@ class SpotifyClient:
                 market=market,
             )
             return manual, applied_features, final_genres
-
-    # ---------- Track details ----------
-    
-    def get_tracks_details(self, track_ids: List[str]) -> Dict[str, Dict[str, Any]]:
-        """Get full track details including preview_url."""
-        if not track_ids:
-            return {}
-        
-        tracks_map: Dict[str, Dict[str, Any]] = {}
-        chunk_size = 50  # Spotify allows up to 50 tracks per request
-        
-        for start in range(0, len(track_ids), chunk_size):
-            chunk = track_ids[start : start + chunk_size]
-            if not chunk:
-                continue
-            params = {"ids": ",".join(chunk), "market": self.market}
-            try:
-                response = self._session.get(
-                    f"{self.API_BASE_URL}/tracks",
-                    headers=self._auth_header(),
-                    params=params,
-                    timeout=10,
-                )
-                if response.status_code == 401:
-                    self._refresh_access_token()
-                    response = self._session.get(
-                        f"{self.API_BASE_URL}/tracks",
-                        headers=self._auth_header(),
-                        params=params,
-                        timeout=10,
-                    )
-                if not response.ok:
-                    continue
-                payload = response.json() or {}
-                for track in payload.get("tracks", []) or []:
-                    if track and track.get("id"):
-                        tracks_map[track["id"]] = track
-            except requests.RequestException:
-                continue
-        
-        return tracks_map
 
     # ---------- Audio features ----------
 

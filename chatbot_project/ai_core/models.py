@@ -15,8 +15,6 @@ class Track:
     artists: List[str]
     external_url: str
     album_image: Optional[str]
-    uri: Optional[str] = None
-    preview_url: Optional[str] = None
     audio_features: Optional[Dict[str, float]] = None
     summary: Optional[str] = None
 
@@ -46,13 +44,6 @@ def track_to_payload(track: Track) -> Dict[str, Any]:
         "url": track.external_url,
         "album_image": track.album_image,
     }
-    if track.uri:
-        payload["uri"] = track.uri
-    if track.preview_url:
-        payload["preview_url"] = track.preview_url
-    else:
-        # preview_url이 없으면 None으로 명시적으로 설정
-        payload["preview_url"] = None
     if track.audio_features is not None:
         payload["audio_features"] = track.audio_features
     if track.summary:

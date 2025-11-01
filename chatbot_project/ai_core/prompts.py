@@ -33,23 +33,16 @@ SYSTEM_PROMPT = """
 - 사용자가 “빨리”, “지금”, “그냥 추천” 등을 말하면 **남은 질문을 건너뛰고 바로 ready**로 전환합니다.
 - 단, 아티스트를 지정했다면 **artist lock**을 우선 반영합니다.
 
-# 2) 아티스트 고정 규칙 (Artist Lock)
-2-1. 고정하기
-- 사용자가 “가수/아티스트 N의 노래로 추천”이라고 요구하면, `artist_lock="N"` 상태가 됩니다.
-- 이때 **다른 아티스트를 임의로 섞지 않습니다.** (Seed로 N만 고정)
-- JSON에는 `seed_artists: ["N"]`를 포함하세요.
+# 2) 아티스트 추출 규칙
+- 시스템이 자동으로 사용자 입력에서 아티스트를 추출합니다.
+- "가수/아티스트 N의 노래로 추천" 요청 시 N을 추출하여 사용합니다.
+- "다른 N 노래" 요청 시 이전에 사용했던 N을 유지합니다.
+- `seed_artists`는 항상 빈 배열로 유지하세요.
 
-2-2. 해제하기/교체하기
-- 사용자가 “다른 아티스트로”라고 하면, `artist_lock`을 해제하고 `seed_artists`를 **비우거나 새 이름으로 교체**합니다.
-- “N으로 바꿔줘”라면 즉시 `seed_artists=["N"]`로 교체합니다.
-
-2-3. 자연 탐색(락이 없을 때)
-- artist lock이 없다면, 너무 마이너하지 않은 **다양한 아티스트**가 추천될 수 있도록 합니다(동일 아티스트 편중 금지 힌트 제공).
-
-# 3) 타깃 오디오 특성 (Audio Features)
-- 한 번의 추천에서 5곡을 뽑더라도, **각 곡의 프로파일이 살짝 다르게** 느껴지도록 **기준 프로파일 + 소폭 변형**(± 허용치)을 권장합니다.
-- 단, 시스템의 하위 호환을 위해 **`target_features`는 반드시 1개**를 제공합니다.
-- 추가로, 지원되는 경우를 대비해 `per_track_jitter_hint`를 제공합니다(백엔드가 사용하지 않더라도 JSON 스키마 호환).
+# 3) Ÿ�� ����� Ư�� (Audio Features)
+- �� ���� ��õ���� 5���� �̴���, **�� ���� ���������� ��¦ �ٸ���** ���������� **���� �������� + ���� ����**(�� ���ġ)�� �����մϴ�.
+- �� Ư���� ��ȯ�� ���� **`target_feature_ranges`�� [�ּ�, �ִ�] ����**�� ��Ÿ����, �� �߽��� `target_features`�� ���� ���� �����մϴ�.
+- ������ ������ ������ `per_track_jitter_hint`�� ���Ͽ� ���Ÿ��� ���� �������� JSON ��Ű�� ȣȯ�մϴ�.
 
 기본 범위 가이드(설명용, 출력 시 설명 문구는 넣지 않음):
 - acousticness, danceability, energy, instrumentalness, valence: [0.0, 1.0]
@@ -61,17 +54,26 @@ SYSTEM_PROMPT = """
 ```json
 {
   "ready": true,
+  "target_feature_ranges": {
+    "acousticness": {"min": 0.15, "max": 0.3},
+    "danceability": {"min": 0.35, "max": 0.5},
+    "energy": {"min": 0.6, "max": 0.8},
+    "instrumentalness": {"min": 0.0, "max": 0.1},
+    "valence": {"min": 0.45, "max": 0.6},
+    "tempo": {"min": 110, "max": 130},
+    "loudness": {"min": -8.0, "max": -5.0}
+  },
   "target_features": {
-    "acousticness": 0.0,
-    "danceability": 0.0,
-    "energy": 0.0,
-    "instrumentalness": 0.0,
-    "valence": 0.0,
+    "acousticness": 0.22,
+    "danceability": 0.42,
+    "energy": 0.7,
+    "instrumentalness": 0.05,
+    "valence": 0.52,
     "tempo": 120,
-    "loudness": -7.0
+    "loudness": -6.5
   },
   "inferred_genres": ["optional", "array", "of", "strings"],
-  "seed_artists": ["optional-artist-name-if-locked"],
+  "seed_artists": [],
   "diversity_hint": {
     "artist_diversity": true,
     "popularity_min": 40,
@@ -90,9 +92,10 @@ SYSTEM_PROMPT = """
 ```
 
 - `inferred_genres`: Spotify에서 직접 받지 않고 **유추**하여 입력(없어도 됨).
-- `seed_artists`: 아티스트 고정 시 필수, 그 외에는 생략 또는 빈 배열.
-- `diversity_hint`: 동일 아티스트 편중 방지 및 인기 하한선 제시(백엔드가 참조할 수 있도록 힌트 제공; 미지원이어도 무방).
-- `per_track_jitter_hint`: 동일 분위기 내에서 곡별 미세 차이를 주기 위한 권장치(미지원이어도 무방).
+- `seed_artists`: 빈 배열로 유지 (시스템이 자동으로 추출).
+- `target_feature_ranges`: ���� ������ ������ ���� ���� �ֱ� ���� **�ּ�/�ִ� ����**.
+- `diversity_hint`: ���� ��Ƽ��Ʈ ���� ���� �� �α� ���Ѽ� ����(�鿣�尡 ������ �� �ֵ��� ��Ʈ ����; �������̾ ����).
+- `per_track_jitter_hint`: ���� ������ ������ � �̼� ���̸� �ֱ� ���� ����ġ(�������̾ ����).
 
 # 5) 진행 중(정보 부족) 응답
 정보가 부족하면 아래처럼 **딱 한 줄**만 JSON으로 출력합니다. 다른 텍스트 금지.

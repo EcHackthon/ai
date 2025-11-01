@@ -18,6 +18,7 @@ class GeminiResponse:
         response_type: str = "conversation",
         target_features: Optional[Dict[str, Any]] = None,
         genres: Optional[List[str]] = None,
+        target_feature_ranges: Optional[Dict[str, Dict[str, float]]] = None,
         seed_artists: Optional[List[str]] = None,
         meta: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -26,6 +27,7 @@ class GeminiResponse:
         self.type = response_type
         self.meta = meta or {}
         self.target_features = target_features
+        self.target_feature_ranges = target_feature_ranges
         self.genres = genres or []
         self.seed_artists = seed_artists or []
 
@@ -35,6 +37,7 @@ class GeminiResponse:
             "message": self.message,
             "meta": self.meta,
             "target_features": self.target_features,
+            "target_feature_ranges": self.target_feature_ranges,
             "genres": self.genres,
             "seed_artists": self.seed_artists,
         }
@@ -63,18 +66,29 @@ class StrictGeminiMusicChat:
         if not api_key:
             raise RuntimeError("Gemini API key missing. Set settings.gemini_api_key or GEMINI_API_KEY.")
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(
-            model_name,
-            system_instruction=SYSTEM_PROMPT,
-            generation_config={
-                "temperature": 0.7,
-                "top_p": 0.9,
-                "max_output_tokens": 2048,
-            },
-        )
+        generation_config = {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_output_tokens": 2048,
+        }
+        self._system_instruction_supported = True
+        try:
+            self.model = genai.GenerativeModel(
+                model_name,
+                system_instruction=SYSTEM_PROMPT,
+                generation_config=generation_config,
+            )
+        except TypeError:
+            # Older / alternate SDK versions do not accept system_instruction.
+            self._system_instruction_supported = False
+            self.model = genai.GenerativeModel(
+                model_name,
+                generation_config=generation_config,
+            )
         self.history: List[Dict[str, str]] = []
         self.analysis_ready: bool = False
         self._target_features: Optional[Dict[str, float]] = None
+        self._target_feature_ranges: Optional[Dict[str, Dict[str, float]]] = None
         self._inferred_genres: Optional[List[str]] = None
         self._seed_artists: Optional[List[str]] = None
         self._diversity_hint: Optional[Dict[str, Any]] = None
@@ -84,6 +98,7 @@ class StrictGeminiMusicChat:
         self.history.clear()
         self.analysis_ready = False
         self._target_features = None
+        self._target_feature_ranges = None
         self._inferred_genres = None
         self._seed_artists = None
         self._diversity_hint = None
@@ -95,7 +110,10 @@ class StrictGeminiMusicChat:
             for turn in self.history[-8:]:
                 parts.append({"role": "user", "parts": [turn["user"]]})
                 parts.append({"role": "model", "parts": [turn["assistant"]]})
-        parts.append({"role": "user", "parts": [text]})
+        prompt_text = text
+        if not self._system_instruction_supported and SYSTEM_PROMPT:
+            prompt_text = f"{SYSTEM_PROMPT.strip()}\n\n{prompt_text}"
+        parts.append({"role": "user", "parts": [prompt_text]})
         resp = self.model.generate_content(parts)
         return getattr(resp, "text", "") or ""
 
@@ -109,6 +127,7 @@ class StrictGeminiMusicChat:
                 assistant_show,
                 response_type="error",
                 target_features=self._target_features,
+                target_feature_ranges=self._target_feature_ranges,
                 genres=self._inferred_genres,
                 seed_artists=self._seed_artists,
             )
@@ -133,6 +152,11 @@ class StrictGeminiMusicChat:
                 if not isinstance(tf, dict):
                     tf = None
                 self._target_features = tf
+
+                tfr = data.get("target_feature_ranges")
+                if not isinstance(tfr, dict):
+                    tfr = None
+                self._target_feature_ranges = tfr
 
                 ig = data.get("inferred_genres")
                 if isinstance(ig, list):
@@ -169,6 +193,7 @@ class StrictGeminiMusicChat:
             assistant_show,
             response_type=response_type,
             target_features=self._target_features,
+            target_feature_ranges=self._target_feature_ranges,
             genres=self._inferred_genres,
             seed_artists=self._seed_artists,
         )
@@ -178,6 +203,7 @@ class StrictGeminiMusicChat:
             return None
         return {
             "target_features": self._target_features,
+            "target_feature_ranges": self._target_feature_ranges,
             "genres": self._inferred_genres,
             "seed_artists": self._seed_artists,
             "diversity_hint": self._diversity_hint,

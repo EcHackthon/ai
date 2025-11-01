@@ -54,10 +54,7 @@ source .venv/bin/activate  # Windows는 .venv\Scripts\activate
 pip install -r requirements.txt
 python main.py
 # 기본 5곡이 아닌 다른 개수로 추천받고 싶으면 --limit 옵션을 쓰면 됨.
-python main.py --limit 7 # 수정 전부터 모종의 이유로 개수가 늘어나지 않음. 또한 아티스트나 장르를 언급 안하면 1개만 나오기도 함
-#채팅을 위한 서버 실행, 위의 python main.py 대신 실행하면 됨
-python main.py --server
-
+python main.py --limit 7
 # Local 에서 환경이 되있는 경우엔, virtual-simulation 단계는 건너 뛰어도 됨.
 ```
 
