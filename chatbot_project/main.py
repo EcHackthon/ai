@@ -9,49 +9,12 @@ from typing import Optional
 
 from ai_core.config import Settings
 from ai_core.strict_chat import StrictGeminiMusicChat as GeminiMusicChat
-from ai_core.recommendation_service import RecommendationService
-from ai_core.spotify_client import SpotifyClient, SpotifyAuthError
-
-
-def _print_recommendations(payload: dict) -> None:
-    print("\n🎧 Spotify 추천 플레이리스트")
-    print("-" * 40)
-    seed_artists = payload.get("seed_artists") or []
-    seed_genres = payload.get("seed_genres") or []
-    if seed_artists:
-        print(f"선호 아티스트 기준: {', '.join(seed_artists)}")
-    elif seed_genres:
-        print(f"참고 장르: {', '.join(seed_genres)}")
-    for idx, track in enumerate(payload.get("tracks", []), start=1):
-        artists = ", ".join(track["artists"])
-        print(f"{idx}. {track['name']} - {artists}")
-        summary = track.get("summary")
-        if summary:
-            print(f"   🎧 {summary}")
-        if track.get("url"):
-            print(f"   🔗 {track['url']}")
-        features = track.get("audio_features")
-        if isinstance(features, dict) and features:
-            readable = ", ".join(
-                f"{key}: {round(value, 2)}"
-                for key, value in features.items()
-                if isinstance(value, (int, float))
-            )
-            if readable:
-                print(f"   🎚️ {readable}")
-    print("-" * 40)
 
 
 def run_cli(limit: Optional[int] = None) -> None:
     settings = Settings.from_env()
 
     chat = GeminiMusicChat(api_key=settings.gemini_api_key, model_name=settings.gemini_model)
-    spotify_client = SpotifyClient(settings)
-    recommendation_service = RecommendationService(
-        spotify_client,
-        default_limit=limit or 5,
-        market=settings.spotify_market,
-    )
 
     print("=" * 60)
     print("🤖 Gemini 기반 감정형 음악 추천 챗봇")
@@ -79,22 +42,18 @@ def run_cli(limit: Optional[int] = None) -> None:
             print("⚠️ 타겟 오디오 특징이 누락되었습니다. 다시 시도해주세요.")
             continue
 
-        try:
-            recommendation_result = recommendation_service.recommend(
-                target_features=gemini_response.target_features,
-                target_feature_ranges=getattr(gemini_response, 'target_feature_ranges', None),
-                genres=gemini_response.genres,
-                seed_artists=getattr(gemini_response, 'seed_artists', None),
-            )
-        except SpotifyAuthError as exc:
-            print(f"❌ Spotify 인증 오류: {exc}")
-            continue
-
-        payload = recommendation_service.build_backend_payload(recommendation_result)
-        _print_recommendations(payload)
+        # 분석 결과를 백엔드로 전송
+        payload = {
+            "target_features": gemini_response.target_features,
+            "target_feature_ranges": getattr(gemini_response, 'target_feature_ranges', None),
+            "genres": gemini_response.genres,
+            "seed_artists": getattr(gemini_response, 'seed_artists', None),
+            "limit": limit or 5,
+        }
 
         print("\n백엔드 전송용 JSON:")
         print(json.dumps(payload, indent=2, ensure_ascii=False))
+        
         try:
             response = requests.post(
                 "http://localhost:4000/api/recommend",

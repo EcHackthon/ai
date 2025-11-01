@@ -2,7 +2,6 @@
 
 from .config import Settings
 from .gemini_chat import GeminiMusicChat
-from .recommendation_service import RecommendationService
 from .spotify_client import SpotifyClient, SpotifyAuthError
 
 __all__ = [
@@ -12,4 +11,3 @@ __all__ = [
     "SpotifyClient",
     "SpotifyAuthError",
 ]
-
